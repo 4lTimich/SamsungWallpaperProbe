@@ -27,13 +27,13 @@ public class MainActivity extends Activity {
         root.setBackgroundColor(Color.WHITE);
 
         TextView title = new TextView(this);
-        title.setText("Samsung Wallpaper Probe v0.1");
+        title.setText("Samsung Wallpaper Probe v0.2");
         title.setTextColor(Color.BLACK);
         title.setTextSize(24f);
         title.setGravity(Gravity.CENTER);
 
         TextView body = new TextView(this);
-        body.setText("Это тест. После установки обоев добавь на главный экран хотя бы 2 страницы и листай между ними. На фоне должно меняться число xOffset и двигаться большой круг.");
+        body.setText("Вторая проверка. Примени обои, затем: (1) листай страницы рабочего стола, (2) наклоняй телефон. Нас интересуют строки TOUCH и GYRO. Если TOUCH меняется во время свайпа — сможем привязать эффект прямо к движению пальца.");
         body.setTextColor(Color.DKGRAY);
         body.setTextSize(16f);
         body.setGravity(Gravity.CENTER);

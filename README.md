@@ -1,18 +1,11 @@
-# Samsung Wallpaper Probe v0.1
+# Samsung Wallpaper Probe v0.2
 
-Tiny Android live-wallpaper test for Samsung One UI.
+Second input probe for Samsung One UI Home.
 
-## What it tests
+This version tests four channels:
+- page offset callbacks
+- raw touch events delivered to WallpaperService
+- phone rotation sensor (gyro/rotation vector)
+- wallpaper zoom/commands
 
-Whether One UI Home sends horizontal wallpaper offsets while swiping between home-screen pages.
-
-If it works, the wallpaper will:
-- move a large white circle;
-- move an iridescent background field;
-- change the `xOffset` number;
-- briefly show `ONE UI SENDS MOVEMENT ✓`.
-
-## Build
-
-The included GitHub Actions workflow builds a debug APK automatically after the files are pushed to GitHub.
-The produced artifact is named `SamsungWallpaperProbe-v0.1-APK`.
+Build with the included GitHub Actions workflow. The output artifact is `SamsungWallpaperProbe-v0.2-APK`.
