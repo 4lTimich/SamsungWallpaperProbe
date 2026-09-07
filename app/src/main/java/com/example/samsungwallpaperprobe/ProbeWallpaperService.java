@@ -28,7 +28,7 @@ import java.util.ArrayList;
 import java.util.Locale;
 
 /**
- * v0.12: v0.11 paging physics with continuity fixes for glass rendering.
+ * v0.16: existing v0.15 motion kept intact; adds an experimental accessibility bounds probe.
  *
  * Samsung One UI does not publish WallpaperService offsets on the tested device, and
  * accessibility scroll samples are too sparse for frame-by-frame rendering. While the
@@ -1024,7 +1024,7 @@ public class ProbeWallpaperService extends WallpaperService {
                 GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE);
                 GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
 
-                debugBitmap = Bitmap.createBitmap(900, 330, Bitmap.Config.ARGB_8888);
+                debugBitmap = Bitmap.createBitmap(900, 410, Bitmap.Config.ARGB_8888);
                 debugCanvas = new Canvas(debugBitmap);
                 debugPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
@@ -1056,6 +1056,10 @@ public class ProbeWallpaperService extends WallpaperService {
 
                 drawBackground(w, h, nowNs / 1_000_000_000f, bgPos, energy);
                 if (pageCells != null) drawGlass(w, h, glassPos, pages, pageCells, x0, y0, cw, ch, gx, gy, opacity * visibility);
+                if (debug && LauncherScrollBus.boundsFound
+                        && SystemClock.uptimeMillis() - LauncherScrollBus.boundsUptimeMs < 250L) {
+                    drawBoundsMarker(w, h);
+                }
                 if (debug) drawDebug(w, h);
             }
 
@@ -1104,6 +1108,25 @@ public class ProbeWallpaperService extends WallpaperService {
                 }
             }
 
+            private void drawBoundsMarker(int w, int h) {
+                int left = LauncherScrollBus.boundsLeft;
+                int top = LauncherScrollBus.boundsTop;
+                int right = LauncherScrollBus.boundsRight;
+                int bottom = LauncherScrollBus.boundsBottom;
+                float bw = Math.max(10f, right - left);
+                float bh = Math.max(10f, bottom - top);
+                float cx = (left + right) * 0.5f;
+                float cy = (top + bottom) * 0.5f;
+
+                GLES20.glUseProgram(glassProgram);
+                bindQuad(glassProgram, "aPos");
+                GLES20.glUniform2f(GLES20.glGetUniformLocation(glassProgram, "uScreen"), w, h);
+                GLES20.glUniform2f(GLES20.glGetUniformLocation(glassProgram, "uCenter"), cx, cy);
+                GLES20.glUniform2f(GLES20.glGetUniformLocation(glassProgram, "uSize"), bw, bh);
+                GLES20.glUniform1f(GLES20.glGetUniformLocation(glassProgram, "uOpacity"), 0.95f);
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+            }
+
             private void drawDebug(int w, int h) {
                 long now = SystemClock.uptimeMillis();
                 if (now - lastDebugUploadMs > 220L) {
@@ -1115,8 +1138,8 @@ public class ProbeWallpaperService extends WallpaperService {
                 GLES20.glUseProgram(texProgram);
                 bindQuad(texProgram, "aPos");
                 GLES20.glUniform2f(GLES20.glGetUniformLocation(texProgram, "uScreen"), w, h);
-                GLES20.glUniform2f(GLES20.glGetUniformLocation(texProgram, "uCenter"), w * 0.50f, h * 0.145f);
-                GLES20.glUniform2f(GLES20.glGetUniformLocation(texProgram, "uSize"), w * 0.94f, h * 0.25f);
+                GLES20.glUniform2f(GLES20.glGetUniformLocation(texProgram, "uCenter"), w * 0.50f, h * 0.165f);
+                GLES20.glUniform2f(GLES20.glGetUniformLocation(texProgram, "uSize"), w * 0.94f, h * 0.31f);
                 GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
                 GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, debugTexture);
                 GLES20.glUniform1i(GLES20.glGetUniformLocation(texProgram, "uTex"), 0);
@@ -1127,31 +1150,42 @@ public class ProbeWallpaperService extends WallpaperService {
                 debugBitmap.eraseColor(Color.TRANSPARENT);
                 debugPaint.setStyle(Paint.Style.FILL);
                 debugPaint.setColor(Color.argb(220, 0, 0, 0));
-                debugCanvas.drawRoundRect(new RectF(8, 8, 892, 322), 38, 38, debugPaint);
+                debugCanvas.drawRoundRect(new RectF(8, 8, 892, 402), 38, 38, debugPaint);
                 debugPaint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
                 debugPaint.setTextSize(54f);
                 debugPaint.setColor(Color.WHITE);
-                debugCanvas.drawText("GPU Glass Motion v0.15", 38, 68, debugPaint);
+                debugCanvas.drawText("Bounds Probe v0.16", 38, 68, debugPaint);
                 debugPaint.setTypeface(android.graphics.Typeface.DEFAULT);
                 debugPaint.setTextSize(36f);
 
-                String line1, line2, line3, line4, line5;
+                String line1, line2, line3, line4, line5, line6, line7;
                 synchronized (stateLock) {
                     line1 = String.format(Locale.US, "FPS %.1f   SOURCE %s", measuredFps, offsetSource);
                     line2 = String.format(Locale.US, "BG %.3f→%.3f  GLASS %.3f→%.3f  P %d/%d", virtualPosition, virtualTargetPosition, glassPosition, glassTargetPosition, currentPage + 1, pageCount);
-                    line3 = String.format(Locale.US, "A11Y x=%d max=%d dx=%d", a11yScrollX, a11yMaxScrollX, a11yDeltaX);
-                    line4 = String.format(Locale.US, "idx %d>%d count=%d  cand=%d x%d",
+                    long boundsAge = Math.max(0L, SystemClock.uptimeMillis() - LauncherScrollBus.boundsUptimeMs);
+                    line3 = LauncherScrollBus.boundsFound
+                            ? String.format(Locale.US, "BOUNDS %s X=%d Y=%d  %dx%d age=%dms",
+                                    LauncherScrollBus.boundsAnchor, LauncherScrollBus.boundsCenterX, LauncherScrollBus.boundsCenterY,
+                                    LauncherScrollBus.boundsRight - LauncherScrollBus.boundsLeft,
+                                    LauncherScrollBus.boundsBottom - LauncherScrollBus.boundsTop, boundsAge)
+                            : "BOUNDS NOT FOUND: " + LauncherScrollBus.boundsAnchor;
+                    line4 = String.format(Locale.US, "samples=%d changes=%d  node=%s",
+                            LauncherScrollBus.boundsSamples, LauncherScrollBus.boundsChanges, trim(LauncherScrollBus.boundsNodeText, 34));
+                    line5 = String.format(Locale.US, "A11Y x=%d max=%d dx=%d", a11yScrollX, a11yMaxScrollX, a11yDeltaX);
+                    line6 = String.format(Locale.US, "idx %d>%d count=%d  cand=%d x%d",
                             a11yFrom, a11yTo, a11yCount,
                             pendingA11yPage < 0 ? 0 : pendingA11yPage + 1, pendingA11yPageHits);
-                    line5 = trim(String.format(Locale.US, "start %.0fpx slop %dpx | %s%s",
-                            glassStartPhasePx, touchSlopPx, lastDecision,
-                            a11ySummary.isEmpty() ? "" : " | " + a11ySummary), 72);
+                    line7 = trim(String.format(Locale.US, "start %.0fpx slop %dpx | %s",
+                            glassStartPhasePx, touchSlopPx, lastDecision), 72);
                 }
-                debugPaint.setColor(Color.rgb(145, 255, 180)); debugCanvas.drawText(line1, 38, 118, debugPaint);
-                debugPaint.setColor(Color.rgb(185, 220, 255)); debugCanvas.drawText(line2, 38, 164, debugPaint);
-                debugPaint.setColor(Color.WHITE); debugCanvas.drawText(line3, 38, 210, debugPaint);
-                debugCanvas.drawText(line4, 38, 256, debugPaint);
-                debugPaint.setColor(Color.rgb(255, 226, 150)); debugCanvas.drawText(line5, 38, 302, debugPaint);
+                debugPaint.setTextSize(32f);
+                debugPaint.setColor(Color.rgb(145, 255, 180)); debugCanvas.drawText(line1, 38, 112, debugPaint);
+                debugPaint.setColor(Color.rgb(185, 220, 255)); debugCanvas.drawText(line2, 38, 156, debugPaint);
+                debugPaint.setColor(Color.rgb(255, 235, 125)); debugCanvas.drawText(line3, 38, 200, debugPaint);
+                debugPaint.setColor(Color.WHITE); debugCanvas.drawText(line4, 38, 244, debugPaint);
+                debugCanvas.drawText(line5, 38, 288, debugPaint);
+                debugCanvas.drawText(line6, 38, 332, debugPaint);
+                debugPaint.setColor(Color.rgb(255, 226, 150)); debugCanvas.drawText(line7, 38, 376, debugPaint);
             }
 
             private void bindQuad(int program, String attr) {

@@ -13,6 +13,7 @@ public final class Prefs {
     public static final String KEY_SWIPE_SENSITIVITY = "swipe_sensitivity";
     public static final String KEY_SHOW_DEBUG = "show_debug";
     public static final String KEY_GLASS_START_PHASE_PX = "glass_start_phase_px";
+    public static final String KEY_BOUNDS_ANCHOR_LABEL = "bounds_anchor_label";
 
     // v0.12 only: v0.11 overwrote the user's geometry with a bad preset.
     // Restore the exact v0.8 geometry once, then leave the grid alone forever.
@@ -55,6 +56,7 @@ public final class Prefs {
     public static final float DEFAULT_STEP_Y = 0.128f;
     public static final float DEFAULT_GLASS_SIZE = 0.151f;
     public static final float DEFAULT_GLASS_START_PHASE_PX = 4.0f;
+    public static final String DEFAULT_BOUNDS_ANCHOR_LABEL = "Pinterest";
 
     public static void ensureV06GridDefaults(SharedPreferences prefs, int screenW, int screenH) {
         // Existing v0.11 installs already have the incorrect geometry persisted, so merely

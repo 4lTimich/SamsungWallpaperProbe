@@ -1,6 +1,6 @@
 <resources>
     <string name="app_name">Iridescent Wallpaper Lab</string>
-    <string name="wallpaper_name">Iridescent Real Offset Lab</string>
-    <string name="accessibility_service_name">One UI Offset Probe</string>
-    <string name="accessibility_desc">Reads only One UI Home scroll accessibility events so the live wallpaper can follow the real home-screen page animation. It does not request access to other apps or window contents.</string>
+    <string name="wallpaper_name">Iridescent Bounds Lab</string>
+    <string name="accessibility_service_name">One UI Bounds Probe</string>
+    <string name="accessibility_desc">Experimental One UI Home icon-position probe. It reads the accessibility tree only while the active window is Samsung One UI Home, looks for one user-selected app label, and reports that node’s on-screen bounds to the live wallpaper. The app has no INTERNET permission.</string>
 </resources>

@@ -24,6 +24,22 @@ public final class LauncherScrollBus {
     public static volatile String className = "";
     public static volatile String summary = "";
 
+
+    // v0.16: experimental AccessibilityNodeInfo bounds probe.
+    public static volatile long boundsSequence = 0L;
+    public static volatile boolean boundsFound = false;
+    public static volatile long boundsUptimeMs = 0L;
+    public static volatile String boundsAnchor = "";
+    public static volatile int boundsLeft = 0;
+    public static volatile int boundsTop = 0;
+    public static volatile int boundsRight = 0;
+    public static volatile int boundsBottom = 0;
+    public static volatile int boundsCenterX = 0;
+    public static volatile int boundsCenterY = 0;
+    public static volatile long boundsSamples = 0L;
+    public static volatile long boundsChanges = 0L;
+    public static volatile String boundsNodeText = "";
+
     // Last page confirmed by One UI accessibility data. Zero-based.
     // Kept in-process so the grid editor can open directly on the real page.
     public static volatile int authoritativePage = -1;

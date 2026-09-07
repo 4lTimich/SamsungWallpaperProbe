@@ -14,6 +14,7 @@ import android.os.Bundle;
 import android.view.Gravity;
 import android.view.ViewGroup;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -29,6 +30,8 @@ public class MainActivity extends Activity {
     private TextView startPhaseValue;
     private Button debugButton;
     private TextView realOffsetStatus;
+    private EditText boundsAnchorEdit;
+    private TextView boundsProbeStatus;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -55,6 +58,7 @@ public class MainActivity extends Activity {
         if (!prefs.contains(Prefs.KEY_SWIPE_SENSITIVITY)) e.putFloat(Prefs.KEY_SWIPE_SENSITIVITY, 1.80f);
         if (!prefs.contains(Prefs.KEY_SHOW_DEBUG)) e.putBoolean(Prefs.KEY_SHOW_DEBUG, false);
         if (!prefs.contains(Prefs.KEY_GLASS_START_PHASE_PX)) e.putFloat(Prefs.KEY_GLASS_START_PHASE_PX, Prefs.DEFAULT_GLASS_START_PHASE_PX);
+        if (!prefs.contains(Prefs.KEY_BOUNDS_ANCHOR_LABEL)) e.putString(Prefs.KEY_BOUNDS_ANCHOR_LABEL, Prefs.DEFAULT_BOUNDS_ANCHOR_LABEL);
         if (!prefs.contains(Prefs.KEY_GRID_COLS)) e.putInt(Prefs.KEY_GRID_COLS, Prefs.DEFAULT_COLS);
         if (!prefs.contains(Prefs.KEY_GRID_ROWS)) e.putInt(Prefs.KEY_GRID_ROWS, Prefs.DEFAULT_ROWS);
         if (!prefs.contains(Prefs.KEY_GRID_X0)) e.putFloat(Prefs.KEY_GRID_X0, Prefs.DEFAULT_X0);
@@ -80,12 +84,12 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView title = text("Iridescent Wallpaper Lab v0.15", 25f, Color.BLACK, true);
+        TextView title = text("Iridescent Wallpaper Lab v0.16", 25f, Color.BLACK, true);
         title.setGravity(Gravity.CENTER);
         root.addView(title, matchWrap());
 
         TextView body = text(
-                "v0.15: сетку вообще не меняю. Движение откатил к стабильной базе v0.12, но старт стекла теперь имеет отдельную фазовую компенсацию в пикселях. По умолчанию 4 px — ровно тот отрыв, который был заметен в начале свайпа.",
+                "v0.16 — отдельный эксперимент с boundsInScreen. Сетку и текущую физику стекла здесь не меняю. Служба пытается найти одну настоящую иконку One UI и читать её реальные координаты на экране во время свайпа.",
                 16f, Color.DKGRAY, false);
         body.setGravity(Gravity.CENTER);
         body.setPadding(0, dp(14), 0, dp(20));
@@ -132,11 +136,46 @@ public class MainActivity extends Activity {
         root.addView(accessibilityButton, matchWrap());
 
         TextView accessibilityHint = text(
-                "В системных настройках включи службу ‘One UI Offset Probe’. Она настроена получать события ТОЛЬКО от One UI Home (com.sec.android.app.launcher), не запрашивает содержимое окон других приложений и приложению не выдано разрешение INTERNET. После включения вернись сюда и затем на рабочий стол.",
+                "В системных настройках включи службу ‘One UI Bounds Probe’. В v0.16 службе нужен доступ к содержимому окна One UI Home, чтобы получить boundsInScreen выбранной иконки. Код отбрасывает root, если активное окно НЕ com.sec.android.app.launcher, дерево других приложений не обходится, INTERNET-разрешения у приложения нет. После обновления службу лучше выключить и включить заново.",
                 13.5f, Color.DKGRAY, false);
         accessibilityHint.setGravity(Gravity.CENTER);
         accessibilityHint.setPadding(0, dp(6), 0, dp(8));
         root.addView(accessibilityHint, matchWrap());
+
+        TextView boundsTitle = text("Эксперимент: boundsInScreen", 18f, Color.BLACK, true);
+        boundsTitle.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams boundsTitleParams = matchWrap();
+        boundsTitleParams.setMargins(0, dp(16), 0, dp(4));
+        root.addView(boundsTitle, boundsTitleParams);
+
+        TextView boundsHint = text(
+                "По умолчанию ищем Pinterest. Если One UI обновляет координаты accessibility-node во время свайпа, в отладке BOUNDS X должен плавно меняться вместе с настоящей иконкой. Тогда виртуальный offset нам больше не нужен.",
+                13.5f, Color.DKGRAY, false);
+        boundsHint.setGravity(Gravity.CENTER);
+        root.addView(boundsHint, matchWrap());
+
+        boundsAnchorEdit = new EditText(this);
+        boundsAnchorEdit.setSingleLine(true);
+        boundsAnchorEdit.setText(prefs.getString(Prefs.KEY_BOUNDS_ANCHOR_LABEL, Prefs.DEFAULT_BOUNDS_ANCHOR_LABEL));
+        boundsAnchorEdit.setHint("Название иконки, например Pinterest");
+        boundsAnchorEdit.setTextSize(17f);
+        root.addView(boundsAnchorEdit, matchWrap());
+
+        Button saveBoundsAnchor = new Button(this);
+        saveBoundsAnchor.setText("СОХРАНИТЬ ИКОНКУ-МАРКЕР");
+        saveBoundsAnchor.setOnClickListener(v -> {
+            String label = boundsAnchorEdit.getText() == null ? "" : boundsAnchorEdit.getText().toString().trim();
+            if (label.isEmpty()) label = Prefs.DEFAULT_BOUNDS_ANCHOR_LABEL;
+            prefs.edit().putString(Prefs.KEY_BOUNDS_ANCHOR_LABEL, label).apply();
+            boundsAnchorEdit.setText(label);
+            refreshBoundsProbeStatus();
+        });
+        root.addView(saveBoundsAnchor, matchWrap());
+
+        boundsProbeStatus = text("", 14f, Color.DKGRAY, true);
+        boundsProbeStatus.setGravity(Gravity.CENTER);
+        boundsProbeStatus.setPadding(0, dp(6), 0, dp(4));
+        root.addView(boundsProbeStatus, matchWrap());
 
         Button gridEditor = new Button(this);
         gridEditor.setText("РЕДАКТОР СЕТКИ И СТЕКЛА");
@@ -165,7 +204,7 @@ public class MainActivity extends Activity {
         root.addView(wallpaper, matchWrap());
 
         TextView note = text(
-                "Сетка/редактор в v0.15 оставлены без изменений относительно стабильной ветки v0.12/v0.8. Меняется только кинематика стекла. Отладка остаётся доступной.",
+                "Важно: это диагностическая версия. Сетка, назначения приложений и существующая физика стекла не менялись. Включи ОТЛАДКУ и смотри строку BOUNDS. Если число X меняется во время свайпа — следующий билд переведём на реальные координаты иконки.",
                 14f, Color.DKGRAY, false);
         note.setGravity(Gravity.CENTER);
         note.setPadding(0, dp(18), 0, 0);
@@ -305,6 +344,22 @@ public class MainActivity extends Activity {
             debugButton.setText(debug ? "ОТЛАДКА: ВКЛ" : "ОТЛАДКА: ВЫКЛ");
         }
         refreshRealOffsetStatus();
+        refreshBoundsProbeStatus();
+    }
+
+    private void refreshBoundsProbeStatus() {
+        if (boundsProbeStatus == null) return;
+        String anchor = prefs.getString(Prefs.KEY_BOUNDS_ANCHOR_LABEL, Prefs.DEFAULT_BOUNDS_ANCHOR_LABEL);
+        if (LauncherScrollBus.boundsFound) {
+            long age = Math.max(0L, android.os.SystemClock.uptimeMillis() - LauncherScrollBus.boundsUptimeMs);
+            boundsProbeStatus.setText(String.format(Locale.US, "FOUND %s: x=%d y=%d  changes=%d  age=%dms",
+                    anchor, LauncherScrollBus.boundsCenterX, LauncherScrollBus.boundsCenterY,
+                    LauncherScrollBus.boundsChanges, age));
+            boundsProbeStatus.setTextColor(Color.rgb(20, 125, 65));
+        } else {
+            boundsProbeStatus.setText("Пока не вижу bounds для: " + anchor);
+            boundsProbeStatus.setTextColor(Color.rgb(145, 75, 20));
+        }
     }
 
     private void refreshRealOffsetStatus() {
