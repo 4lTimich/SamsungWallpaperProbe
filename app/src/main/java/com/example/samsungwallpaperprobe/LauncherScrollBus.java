@@ -1,11 +1,14 @@
 package com.example.samsungwallpaperprobe;
 
 /**
- * v0.19 bridge between the One UI accessibility tracker and the wallpaper renderer.
+ * v0.20 bridge between the One UI accessibility tracker and the wallpaper renderer.
  *
- * The tracker caches a snapshot of ALL launcher icon-like nodes when Home becomes visible.
- * During motion it refreshes only one real AccessibilityNodeInfo (the anchor).  The wallpaper
- * can therefore move the cached layout as a rigid body without polling every app at frame rate.
+ * Two real launcher icons are tracked at the same time:
+ *  - left/bottom anchor: survives longer while moving toward the previous page;
+ *  - right/top anchor: survives longer while moving toward the next page.
+ *
+ * The accessibility service publishes one unified real page position selected from the fresher
+ * directional anchor. Touch remains only a short temporal bridge between real bounds updates.
  */
 public final class LauncherScrollBus {
     private LauncherScrollBus() {}
@@ -14,39 +17,36 @@ public final class LauncherScrollBus {
     public static volatile boolean wallpaperVisible = false;
     public static volatile boolean homeActive = false;
 
-    // Home-entry/layout rescan handshake.
     public static volatile long homeEpoch = 0L;
     public static volatile long rescanGeneration = 0L;
 
-    // Continuous real page position from one anchor icon. 0 = page 1, 1 = page 2, etc.
+    // Unified continuous real page position. 0 = page 1, 1 = page 2, etc.
     public static volatile boolean positionValid = false;
     public static volatile float position = 0f;
     public static volatile float velocityPagesPerSec = 0f;
     public static volatile long positionUptimeMs = 0L;
     public static volatile long positionSequence = 0L;
 
-    // More useful than polling frequency: how often Samsung actually changes bounds.
     public static volatile float trackerPollHz = 0f;
     public static volatile float boundsChangeHz = 0f;
     public static volatile long boundsSamples = 0L;
     public static volatile long boundsChanges = 0L;
 
-    // Last two genuinely changed position samples. Used by the renderer for post-touch prediction.
     public static volatile float previousChangedPosition = 0f;
     public static volatile long previousChangedUptimeMs = 0L;
     public static volatile float lastChangedPosition = 0f;
     public static volatile long lastChangedUptimeMs = 0L;
 
-    // High-rate touch bridge. Touch NEVER decides a page; it only fills time between real bounds
-    // samples while the finger is down.
+    // Touch bridge. It never decides the page or simulates a fling.
     public static volatile boolean touchActive = false;
     public static volatile float touchX = 0f;
     public static volatile long touchUptimeMs = 0L;
     public static volatile long touchSequence = 0L;
     public static volatile float touchXAtLastBoundsChange = 0f;
     public static volatile boolean touchWasActiveAtLastBoundsChange = false;
+    public static volatile float touchVelocityX = 0f; // px/sec; finger left is negative
 
-    // Cached anchor metadata.
+    // Legacy/public unified anchor metadata used by the renderer/debug overlay.
     public static volatile String anchorLabel = "";
     public static volatile int anchorLeft = 0;
     public static volatile int anchorTop = 0;
@@ -57,17 +57,33 @@ public final class LauncherScrollBus {
     public static volatile float anchorWorldX = 0f;
     public static volatile long anchorReacquires = 0L;
 
+    // Dual-anchor diagnostics.
+    public static volatile boolean anchorLeftBottomValid = false;
+    public static volatile String anchorLeftBottomLabel = "";
+    public static volatile int anchorLeftBottomX = 0;
+    public static volatile int anchorLeftBottomY = 0;
+    public static volatile float anchorLeftBottomPosition = 0f;
+    public static volatile long anchorLeftBottomChangedMs = 0L;
+
+    public static volatile boolean anchorRightTopValid = false;
+    public static volatile String anchorRightTopLabel = "";
+    public static volatile int anchorRightTopX = 0;
+    public static volatile int anchorRightTopY = 0;
+    public static volatile float anchorRightTopPosition = 0f;
+    public static volatile long anchorRightTopChangedMs = 0L;
+
+    public static volatile String activeAnchorRole = "NONE";
+    public static volatile float anchorDisagreementPx = 0f;
+
     // Cached launcher icon layout. Immutable array replacement = lock-free reader side.
     public static volatile IconBox[] iconSnapshot = new IconBox[0];
     public static volatile long iconSnapshotVersion = 0L;
     public static volatile long layoutScans = 0L;
     public static volatile long lastLayoutScanMs = 0L;
 
-    // Stable page inferred only when the real anchor is stationary near an integer page.
     public static volatile int authoritativePage = -1;
     public static volatile long authoritativePageUptimeMs = 0L;
 
-    // Human-readable state for diagnostics.
     public static volatile String trackerState = "WAITING";
 
     public static final class IconBox {
@@ -77,7 +93,7 @@ public final class LauncherScrollBus {
         public final float height;
         public final String label;
         public final boolean movesWithPages;
-        public final int pageIndex; // -1 for dock / page-independent nodes
+        public final int pageIndex;
 
         public IconBox(float worldCenterX, float centerY, float width, float height, String label, boolean movesWithPages, int pageIndex) {
             this.worldCenterX = worldCenterX;
@@ -99,6 +115,7 @@ public final class LauncherScrollBus {
     public static void onWallpaperHidden() {
         wallpaperVisible = false;
         touchActive = false;
+        touchVelocityX = 0f;
     }
 
     public static void requestRescan() {
@@ -109,5 +126,8 @@ public final class LauncherScrollBus {
         positionValid = false;
         trackerState = state;
         anchorLabel = "";
+        anchorLeftBottomValid = false;
+        anchorRightTopValid = false;
+        activeAnchorRole = "NONE";
     }
 }

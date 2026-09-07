@@ -27,12 +27,11 @@ import java.util.Locale;
 import java.util.concurrent.locks.LockSupport;
 
 /**
- * v0.19: page-scoped cached-layout bounds engine.
+ * v0.20: dual-anchor cached-layout bounds engine.
  *
- * The real One UI icon bounds remain authoritative. Touch is re-enabled only as a high-rate
- * temporal bridge between real bounds samples; it never selects a page and never runs a virtual
- * fling/spring. The accessibility service also publishes a cached layout of all app-like nodes,
- * which can be outlined independently of the old glass grid.
+ * Two real One UI icon bounds are authoritative: left/bottom and right/top. Touch remains only
+ * a temporal bridge between real bounds samples; it never selects a page or simulates launcher
+ * physics. The cached icon layout and old manual glass grid are both retained.
  */
 public class ProbeWallpaperService extends WallpaperService {
 
@@ -57,6 +56,8 @@ public class ProbeWallpaperService extends WallpaperService {
         private float displayPosition = 0f;
         private float motionEnergy = 0f;
         private String source = "BOUNDS WAIT";
+        private float lastTouchEventX = 0f;
+        private long lastTouchEventMs = 0L;
 
         // Grid cache. Geometry is intentionally unchanged from the v0.8 branch.
         private int gridCols = Prefs.DEFAULT_COLS;
@@ -135,14 +136,33 @@ public class ProbeWallpaperService extends WallpaperService {
             super.onTouchEvent(event);
             if (event == null) return;
             int action = event.getActionMasked();
-            LauncherScrollBus.touchX = event.getX();
-            LauncherScrollBus.touchUptimeMs = SystemClock.uptimeMillis();
-            LauncherScrollBus.touchSequence++;
-            if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_MOVE) {
+            float x = event.getX();
+            long eventMs = event.getEventTime();
+
+            if (action == MotionEvent.ACTION_DOWN) {
+                lastTouchEventX = x;
+                lastTouchEventMs = eventMs;
+                LauncherScrollBus.touchVelocityX = 0f;
+                LauncherScrollBus.touchActive = true;
+            } else if (action == MotionEvent.ACTION_MOVE) {
+                long dt = eventMs - lastTouchEventMs;
+                if (dt > 0L && dt < 120L) {
+                    float instant = (x - lastTouchEventX) * 1000f / dt;
+                    LauncherScrollBus.touchVelocityX =
+                            LauncherScrollBus.touchVelocityX * 0.45f + instant * 0.55f;
+                }
+                lastTouchEventX = x;
+                lastTouchEventMs = eventMs;
                 LauncherScrollBus.touchActive = true;
             } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
                 LauncherScrollBus.touchActive = false;
+                LauncherScrollBus.touchVelocityX = 0f;
+                lastTouchEventMs = 0L;
             }
+
+            LauncherScrollBus.touchX = x;
+            LauncherScrollBus.touchUptimeMs = SystemClock.uptimeMillis();
+            LauncherScrollBus.touchSequence++;
         }
 
         @Override
@@ -558,7 +578,7 @@ public class ProbeWallpaperService extends WallpaperService {
                 debugPaint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
                 debugPaint.setTextSize(54f);
                 debugPaint.setColor(Color.WHITE);
-                debugCanvas.drawText("Bounds Engine v0.19", 38, 68, debugPaint);
+                debugCanvas.drawText("Dual Bounds Engine v0.20", 38, 68, debugPaint);
                 debugPaint.setTypeface(android.graphics.Typeface.DEFAULT);
                 debugPaint.setTextSize(31f);
 
@@ -570,17 +590,19 @@ public class ProbeWallpaperService extends WallpaperService {
                     l2 = String.format(Locale.US, "POS %.4f  PAGE %d/%d  v=%.3f", displayPosition,
                             LauncherScrollBus.authoritativePage < 0 ? 0 : LauncherScrollBus.authoritativePage + 1,
                             pageCount, LauncherScrollBus.velocityPagesPerSec);
-                    l3 = String.format(Locale.US, "%s  ANCHOR %s", source, trim(LauncherScrollBus.anchorLabel, 28));
-                    l4 = String.format(Locale.US, "X %d  world %.1f  age %dms  touch=%s",
-                            LauncherScrollBus.anchorCenterX, LauncherScrollBus.anchorWorldX, age,
-                            LauncherScrollBus.touchActive ? "DOWN" : "UP");
-                    l5 = String.format(Locale.US, "icons %d  scans %d  reacq %d",
+                    l3 = String.format(Locale.US, "%s  ACTIVE %s", source, LauncherScrollBus.activeAnchorRole);
+                    l4 = String.format(Locale.US, "LB x=%d %.3f  RT x=%d %.3f  diff=%.1fpx",
+                            LauncherScrollBus.anchorLeftBottomX, LauncherScrollBus.anchorLeftBottomPosition,
+                            LauncherScrollBus.anchorRightTopX, LauncherScrollBus.anchorRightTopPosition,
+                            LauncherScrollBus.anchorDisagreementPx);
+                    l5 = String.format(Locale.US, "LB %s | RT %s",
+                            trim(LauncherScrollBus.anchorLeftBottomLabel, 22),
+                            trim(LauncherScrollBus.anchorRightTopLabel, 22));
+                    l6 = String.format(Locale.US, "icons %d scans %d reacq %d changes %d",
                             LauncherScrollBus.iconSnapshot.length, LauncherScrollBus.layoutScans,
-                            LauncherScrollBus.anchorReacquires);
-                    l6 = String.format(Locale.US, "samples %d  real changes %d  snapshot v%d",
-                            LauncherScrollBus.boundsSamples, LauncherScrollBus.boundsChanges,
-                            LauncherScrollBus.iconSnapshotVersion);
-                    l7 = trim("STATE " + LauncherScrollBus.trackerState, 70);
+                            LauncherScrollBus.anchorReacquires, LauncherScrollBus.boundsChanges);
+                    l7 = trim(String.format(Locale.US, "STATE %s  touchV=%.0f  age=%dms",
+                            LauncherScrollBus.trackerState, LauncherScrollBus.touchVelocityX, age), 78);
                 }
 
                 debugPaint.setColor(Color.rgb(145, 255, 180)); debugCanvas.drawText(l1, 38, 112, debugPaint);

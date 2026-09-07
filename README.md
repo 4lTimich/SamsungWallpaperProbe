@@ -1,16 +1,27 @@
-# Iridescent Wallpaper v0.19 — page-scoped icon cache
+# Iridescent Wallpaper v0.20 — dual bounds anchors
 
-This build fixes the three layout-outline bugs reported in v0.18 without changing the manual glass grid.
+Эта версия не меняет ручную сетку, стекло, назначения приложений или page-scoped cache из v0.19.
 
-## Fixes
+## Что изменено
 
-1. **Rescan no longer stacks outlines.** A settled scan replaces the cached layout of the current page instead of blindly merging another copy into the global snapshot.
-2. **Old-page icons no longer reappear on a new page.** Hidden launcher nodes are rejected with `isVisibleToUser()`, stale page entries are kept in their own page namespace, and dock entries are refreshed separately.
-3. **Incoming-page outlines are prefetched during the swipe.** The service performs only a few full-tree scans at sparse real-position thresholds (roughly 7.5%, 20%, and 40% of a page). Those scans only cache layout; the high-rate motion source is still one refreshed anchor node.
-4. **The manual grid/editor is untouched.** It remains available as a fallback while the bounds-based layout cache is validated.
+- Одновременно отслеживаются **две реальные иконки One UI**:
+  - `LEFT-BOTTOM` — левая иконка нижнего ряда;
+  - `RIGHT-TOP` — правая иконка верхнего ряда.
+- При свайпе к следующей странице приоритет получает `RIGHT-TOP`, потому что она дольше остаётся на экране.
+- При свайпе к предыдущей странице приоритет получает `LEFT-BOTTOM`.
+- Если один bounds обновился раньше второго, движок не усредняет свежий и старый сигнал. В направлении движения он берёт **ведущую реальную координату** (`max(position)` вперёд, `min(position)` назад).
+- На развороте пальца направление выбора anchor меняется сразу по скорости touch, поэтому короткие движения влево-вправо должны меньше запаздывать.
+- Anchor-пара переснимается заранее, пока подходящий anchor ещё находится примерно в последних 28% экрана, а не после полного исчезновения.
+- Все остальные иконки по-прежнему хранятся в page-scoped snapshot и не опрашиваются 120 раз/с.
+- Белая обводка всех найденных приложений сохранена.
+- Ручная сетка сохранена без изменений.
 
-The cached outline world coordinate is still:
+## Debug
 
-`worldX = boundsCenterX + realPagePosition * screenWidth`
+Плашка показывает обе координаты:
 
-so all cached icons can be moved by the single real anchor position.
+`LB x=... pos=...   RT x=... pos=...   diff=...px`
+
+и `ACTIVE LEFT-BOTTOM / RIGHT-TOP`.
+
+Если Samsung обновляет два node не одновременно, `CHANGE Hz` может стать выше, чем у одного anchor.

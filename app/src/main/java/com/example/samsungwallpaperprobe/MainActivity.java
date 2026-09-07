@@ -76,12 +76,12 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView title = text("Iridescent Bounds Engine v0.19", 25f, Color.BLACK, true);
+        TextView title = text("Iridescent Dual Bounds Engine v0.20", 25f, Color.BLACK, true);
         title.setGravity(Gravity.CENTER);
         root.addView(title, matchWrap());
 
         TextView body = text(
-                "v0.19 хранит bounds по страницам: пересъёмка заменяет текущую страницу вместо накопления дублей, а во время свайпа несколько редких prefetch-сканов заранее подхватывают входящую страницу. " +
+                "v0.20 отслеживает сразу две реальные иконки One UI: левую нижнюю и правую верхнюю. При движении берётся тот реальный bounds, который меньше запаздывает в текущем направлении, а кэш остальных иконок по-прежнему обновляется редко. " +
                 "Сетка оставлена для старого стекла, но bounds-трекер от неё больше не зависит. Высокочастотные touch-события используются только как интерполяция между редкими реальными bounds — они не решают, какая страница выбрана.",
                 16f, Color.DKGRAY, false);
         body.setGravity(Gravity.CENTER);
