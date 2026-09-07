@@ -60,6 +60,7 @@ public class ProbeWallpaperService extends WallpaperService {
         private int lastConfigGeneration = -1;
         private float swipeSensitivity = 1.80f;
         private boolean showDebug = false;
+        private float glassStartPhasePx = Prefs.DEFAULT_GLASS_START_PHASE_PX;
 
         // Visual positions and their smooth targets.
         private float virtualPosition = 0f;
@@ -192,6 +193,10 @@ public class ProbeWallpaperService extends WallpaperService {
                         swipeSensitivity = clamp(sharedPreferences.getFloat(
                                 Prefs.KEY_SWIPE_SENSITIVITY, swipeSensitivity), 0.70f, 2.60f);
                     }
+                    if (Prefs.KEY_GLASS_START_PHASE_PX.equals(key)) {
+                        glassStartPhasePx = clamp(sharedPreferences.getFloat(
+                                Prefs.KEY_GLASS_START_PHASE_PX, glassStartPhasePx), 0f, 12f);
+                    }
                 };
 
         @Override
@@ -222,6 +227,7 @@ public class ProbeWallpaperService extends WallpaperService {
                 pageCount = clampInt(prefs.getInt(Prefs.KEY_PAGE_COUNT, 4), 2, 9);
                 swipeSensitivity = clamp(prefs.getFloat(Prefs.KEY_SWIPE_SENSITIVITY, 1.80f), 0.70f, 2.60f);
                 showDebug = prefs.getBoolean(Prefs.KEY_SHOW_DEBUG, false);
+                glassStartPhasePx = clamp(prefs.getFloat(Prefs.KEY_GLASS_START_PHASE_PX, Prefs.DEFAULT_GLASS_START_PHASE_PX), 0f, 12f);
                 int generation = prefs.getInt(Prefs.KEY_CONFIG_GENERATION, 0);
                 int saved = clampInt(prefs.getInt(Prefs.KEY_SAVED_PAGE, 0), 0, pageCount - 1);
                 if (forcePosition || generation != lastConfigGeneration) {
@@ -428,15 +434,13 @@ public class ProbeWallpaperService extends WallpaperService {
             float deltaPx = touchX - downX;
             float velocityPx = touchVelocityX;
 
-            releaseDistancePages = -deltaPx / w;   // + = next page
+            releaseDistancePages = -deltaPx / w;
             releaseVelocityPages = -velocityPx / w;
             releaseWasHorizontal = Math.abs(touchDx) > Math.abs(touchDy) * 0.72f;
 
-            // v0.13: do not use the old 40% Samsung/Launcher3 threshold as the visual
-            // prediction. Modern One UI accepts ordinary page changes noticeably earlier,
-            // which made our glass sit on the old page and then "teleport" only after A11Y
-            // confirmed the new one. Instead use a conservative hybrid of final distance
-            // and RELEASE velocity. A tiny slow pull still returns to the current page.
+            // Modern One UI switches pages earlier than the archived 40% PagedView gate.
+            // Use release distance + release velocity only for the VISUAL prediction;
+            // accessibility still verifies the final logical page.
             float absDistance = Math.abs(releaseDistancePages);
             float absVelocity = Math.abs(releaseVelocityPages);
             boolean reverseAtRelease = absVelocity >= 0.24f
@@ -486,14 +490,10 @@ public class ProbeWallpaperService extends WallpaperService {
         }
 
         private int launcherSnapDurationMs(int destination, float velocityPx) {
-            // v0.14: restore the slower Launcher3/Samsung-style return curve from v0.12.
-            // v0.13 shortened this too aggressively, so short cancelled drags snapped back
-            // visibly faster than One UI's icons. Keep the same quintic easing, but let slow
-            // returns breathe and use velocity only when the gesture was genuinely fast.
             int w = Math.max(1, surfaceW);
             float distancePx = Math.abs(destination - glassPosition) * w;
             if (Math.abs(velocityPx) < minFlingPx) {
-                return 750;
+                return 750; // Launcher3 config_pageSnapAnimationDuration
             }
             float half = w * 0.5f;
             float ratio = Math.min(1f, distancePx / Math.max(1f, w));
@@ -538,26 +538,25 @@ public class ProbeWallpaperService extends WallpaperService {
         }
 
         private float launcherLikeVisualDx() {
-            if (!visualScrollStarted) return 0f;
-
-            // v0.14: combine the two behaviours that tested best on-device:
-            // - v0.12's quick slop catch-up (~90 ms), which stayed in phase once scrolling began;
-            // - v0.13's removal of ALL velocity/input-lag lead, which was the source of the
-            //   initial 3–4 px forward jump.
-            //
-            // This starts at exactly zero, catches the slop distance over 90 ms, then becomes
-            // pure 1:1 touch tracking. No extrapolation, no fixed lead, no velocity boost.
-            float elapsedMs = Math.max(0f, SystemClock.uptimeMillis() - visualScrollStartMs);
-            float t = clamp(elapsedMs / 90f, 0f, 1f);
-            float smooth = t * t * (3f - 2f * t);
-            return (touchX - visualScrollOriginX) + visualScrollCatchupPx * smooth;
+            // v0.15: empirical One UI phase correction. The launcher icon begins a few
+            // physical pixels later than the raw WallpaperService touch stream. Previous
+            // versions tried to catch that distance up, which made glass move faster at
+            // the beginning and left a permanent 3–4 px lead. Instead we remove a small
+            // constant distance from the CURRENT drag direction. Once past that tiny
+            // deadzone, tracking is exactly 1:1 in both directions — no catch-up and no
+            // velocity/input-lag extrapolation.
+            float dx = touchX - downX;
+            float phase = clamp(glassStartPhasePx, 0f, 12f);
+            float abs = Math.abs(dx);
+            if (abs <= phase) return 0f;
+            return Math.signum(dx) * (abs - phase);
         }
 
         private void updateAuthoritativeTouchPreview() {
             int w = Math.max(1, surfaceW);
             float rawPageDelta = -launcherLikeVisualDx() / w;
-            float glass = applyEdgeRubber(gestureBasePage + rawPageDelta, 0.07f);
-            float bg = applyEdgeRubber(gestureBasePage + rawPageDelta * swipeSensitivity, 0.11f);
+            float glass = applyEdgeRubber(gestureBasePage + rawPageDelta, 0.20f);
+            float bg = applyEdgeRubber(gestureBasePage + rawPageDelta * swipeSensitivity, 0.28f);
             // Direct assignment is intentional: MotionEvent is the highest-rate signal we
             // have while dragging and follows reversals immediately. No A11Y jitter here.
             glassPosition = glass;
@@ -575,8 +574,8 @@ public class ProbeWallpaperService extends WallpaperService {
         private void updateFallbackDraggedPositions() {
             int w = Math.max(1, surfaceW);
             float rawPageDelta = -launcherLikeVisualDx() / w;
-            virtualPosition = applyEdgeRubber(gestureBasePage + rawPageDelta * swipeSensitivity, 0.11f);
-            glassPosition = applyEdgeRubber(gestureBasePage + rawPageDelta, 0.07f);
+            virtualPosition = applyEdgeRubber(gestureBasePage + rawPageDelta * swipeSensitivity, 0.28f);
+            glassPosition = applyEdgeRubber(gestureBasePage + rawPageDelta, 0.20f);
             virtualTargetPosition = virtualPosition;
             glassTargetPosition = glassPosition;
             offsetSource = visualScrollStarted ? "SAMSUNG TOUCH MODEL" : "SAMSUNG TOUCH SLOP";
@@ -692,14 +691,10 @@ public class ProbeWallpaperService extends WallpaperService {
                     // the next index while a slow partial drag is still springing back.
                     observeA11yPageCandidate(a11yTo, nowMs);
 
-                    // But for a clearly non-weak release, a post-release candidate in the
-                    // same direction is useful immediately as a VISUAL target. We still do
-                    // not save the page until the normal confirmation logic below. This is
-                    // what prevents "old page ... wait ... teleport to new page".
                     int candidateDir = Integer.signum(a11yTo - currentPage);
-                    int releaseDir = Integer.signum((int) Math.signum(
-                            Math.abs(releaseVelocityPages) >= 0.34f
-                                    ? releaseVelocityPages : releaseDistancePages));
+                    float releaseSignal = Math.abs(releaseVelocityPages) >= 0.34f
+                            ? releaseVelocityPages : releaseDistancePages;
+                    int releaseDir = releaseSignal > 0f ? 1 : (releaseSignal < 0f ? -1 : 0);
                     boolean candidateDirectionFits = candidateDir != 0
                             && candidateDir == releaseDir
                             && releaseWasHorizontal
@@ -707,7 +702,7 @@ public class ProbeWallpaperService extends WallpaperService {
                     if (candidateDirectionFits && a11yTo != predictedReleasePage) {
                         predictedReleasePage = a11yTo;
                         targetPage = a11yTo;
-                        startQuinticSnap(a11yTo, 245, "A11Y EARLY TARGET");
+                        startQuinticSnap(a11yTo, 320, "A11Y EARLY TARGET");
                     }
 
                     lastDecision = "A11Y PAGE CANDIDATE " + (a11yTo + 1)
@@ -1086,10 +1081,9 @@ public class ProbeWallpaperService extends WallpaperService {
                 GLES20.glUniform2f(uSize, cw * w, ch * h);
                 GLES20.glUniform1f(uOpacity, opacity);
 
-                // v0.13: render every non-empty configured page and let the per-cell
-                // screen bounds cull it. This is cheap for our tiny 4x6 grid and completely
-                // removes the last floor/ceil race where glass could disappear during an
-                // A11Y retarget or while the outgoing page was still a few pixels visible.
+                // v0.15: draw all non-empty configured pages. With a 4x6 grid this is
+                // cheap on GPU and guarantees that an outgoing/incoming glass pad cannot
+                // disappear just because the logical page target changed mid-animation.
                 for (int page = 0; page < pages; page++) {
                     if (pageCells[page] == null || pageCells[page].isEmpty()) continue;
                     drawGlassPage(w, h, pos, page, pageCells[page],
@@ -1137,7 +1131,7 @@ public class ProbeWallpaperService extends WallpaperService {
                 debugPaint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
                 debugPaint.setTextSize(54f);
                 debugPaint.setColor(Color.WHITE);
-                debugCanvas.drawText("GPU Samsung PagedView v0.12", 38, 68, debugPaint);
+                debugCanvas.drawText("GPU Glass Motion v0.15", 38, 68, debugPaint);
                 debugPaint.setTypeface(android.graphics.Typeface.DEFAULT);
                 debugPaint.setTextSize(36f);
 
@@ -1149,8 +1143,8 @@ public class ProbeWallpaperService extends WallpaperService {
                     line4 = String.format(Locale.US, "idx %d>%d count=%d  cand=%d x%d",
                             a11yFrom, a11yTo, a11yCount,
                             pendingA11yPage < 0 ? 0 : pendingA11yPage + 1, pendingA11yPageHits);
-                    line5 = trim(String.format(Locale.US, "lag %.0fms slop %dpx | %s%s",
-                            touchDeliveryLagMs, touchSlopPx, lastDecision,
+                    line5 = trim(String.format(Locale.US, "start %.0fpx slop %dpx | %s%s",
+                            glassStartPhasePx, touchSlopPx, lastDecision,
                             a11ySummary.isEmpty() ? "" : " | " + a11ySummary), 72);
                 }
                 debugPaint.setColor(Color.rgb(145, 255, 180)); debugCanvas.drawText(line1, 38, 118, debugPaint);

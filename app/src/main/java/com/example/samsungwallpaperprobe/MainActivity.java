@@ -26,6 +26,7 @@ public class MainActivity extends Activity {
     private TextView pagesValue;
     private TextView currentValue;
     private TextView sensitivityValue;
+    private TextView startPhaseValue;
     private Button debugButton;
     private TextView realOffsetStatus;
 
@@ -53,6 +54,7 @@ public class MainActivity extends Activity {
         if (!prefs.contains(Prefs.KEY_SAVED_PAGE)) e.putInt(Prefs.KEY_SAVED_PAGE, 0);
         if (!prefs.contains(Prefs.KEY_SWIPE_SENSITIVITY)) e.putFloat(Prefs.KEY_SWIPE_SENSITIVITY, 1.80f);
         if (!prefs.contains(Prefs.KEY_SHOW_DEBUG)) e.putBoolean(Prefs.KEY_SHOW_DEBUG, false);
+        if (!prefs.contains(Prefs.KEY_GLASS_START_PHASE_PX)) e.putFloat(Prefs.KEY_GLASS_START_PHASE_PX, Prefs.DEFAULT_GLASS_START_PHASE_PX);
         if (!prefs.contains(Prefs.KEY_GRID_COLS)) e.putInt(Prefs.KEY_GRID_COLS, Prefs.DEFAULT_COLS);
         if (!prefs.contains(Prefs.KEY_GRID_ROWS)) e.putInt(Prefs.KEY_GRID_ROWS, Prefs.DEFAULT_ROWS);
         if (!prefs.contains(Prefs.KEY_GRID_X0)) e.putFloat(Prefs.KEY_GRID_X0, Prefs.DEFAULT_X0);
@@ -78,12 +80,12 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView title = text("Iridescent Wallpaper Lab v0.12", 25f, Color.BLACK, true);
+        TextView title = text("Iridescent Wallpaper Lab v0.15", 25f, Color.BLACK, true);
         title.setGravity(Gravity.CENTER);
         root.addView(title, matchWrap());
 
         TextView body = text(
-                "v0.12: сетка возвращена к поведению v0.8. В движении исправлены два локальных дефекта: стекло больше не должно исчезать на границе страниц, а начало свайпа плавно набирает компенсацию вместо скачка на несколько пикселей.",
+                "v0.15: сетку вообще не меняю. Движение откатил к стабильной базе v0.12, но старт стекла теперь имеет отдельную фазовую компенсацию в пикселях. По умолчанию 4 px — ровно тот отрыв, который был заметен в начале свайпа.",
                 16f, Color.DKGRAY, false);
         body.setGravity(Gravity.CENTER);
         body.setPadding(0, dp(14), 0, dp(20));
@@ -107,6 +109,17 @@ public class MainActivity extends Activity {
         sensitivityValue = text("", 27f, Color.BLACK, true);
         sensitivityValue.setGravity(Gravity.CENTER);
         root.addView(makeSensitivityStepper(), matchWrap());
+
+        TextView phaseLabel = text("Компенсация старта стекла", 17f, Color.BLACK, true);
+        phaseLabel.setPadding(0, dp(16), 0, 0);
+        root.addView(phaseLabel, matchWrap());
+        startPhaseValue = text("", 27f, Color.BLACK, true);
+        startPhaseValue.setGravity(Gravity.CENTER);
+        root.addView(makeStartPhaseStepper(), matchWrap());
+        TextView phaseHint = text("Если стекло на старте уезжает вперёд — увеличь на 1 px. Если отстаёт — уменьши. Это не меняет сетку и не влияет на движение после старта.", 13.5f, Color.DKGRAY, false);
+        phaseHint.setGravity(Gravity.CENTER);
+        phaseHint.setPadding(0, dp(4), 0, dp(8));
+        root.addView(phaseHint, matchWrap());
 
         realOffsetStatus = text("", 15f, Color.DKGRAY, true);
         realOffsetStatus.setGravity(Gravity.CENTER);
@@ -152,7 +165,7 @@ public class MainActivity extends Activity {
         root.addView(wallpaper, matchWrap());
 
         TextView note = text(
-                "Геометрию редактора больше не меняю: v0.12 один раз возвращает значения v0.8 и дальше сохраняет твои ручные настройки. Назначения приложений по ячейкам при восстановлении геометрии не удаляются. Отладка остаётся доступной.",
+                "Сетка/редактор в v0.15 оставлены без изменений относительно стабильной ветки v0.12/v0.8. Меняется только кинематика стекла. Отладка остаётся доступной.",
                 14f, Color.DKGRAY, false);
         note.setGravity(Gravity.CENTER);
         note.setPadding(0, dp(18), 0, 0);
@@ -210,6 +223,35 @@ public class MainActivity extends Activity {
         return row;
     }
 
+    private LinearLayout makeStartPhaseStepper() {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER);
+
+        Button minus = new Button(this);
+        minus.setText("−");
+        Button plus = new Button(this);
+        plus.setText("+");
+
+        LinearLayout.LayoutParams side = new LinearLayout.LayoutParams(dp(84), dp(56));
+        LinearLayout.LayoutParams center = new LinearLayout.LayoutParams(dp(110), dp(56));
+
+        minus.setOnClickListener(v -> changeStartPhase(-1f));
+        plus.setOnClickListener(v -> changeStartPhase(1f));
+
+        row.addView(minus, side);
+        row.addView(startPhaseValue, center);
+        row.addView(plus, side);
+        return row;
+    }
+
+    private void changeStartPhase(float delta) {
+        float current = prefs.getFloat(Prefs.KEY_GLASS_START_PHASE_PX, Prefs.DEFAULT_GLASS_START_PHASE_PX);
+        float next = clamp(current + delta, 0f, 12f);
+        prefs.edit().putFloat(Prefs.KEY_GLASS_START_PHASE_PX, next).apply();
+        refreshValues();
+    }
+
     private void changePageCount(int delta) {
         int oldCount = prefs.getInt(Prefs.KEY_PAGE_COUNT, 4);
         int count = clamp(oldCount + delta, 2, 9);
@@ -252,11 +294,13 @@ public class MainActivity extends Activity {
         int count = prefs.getInt(Prefs.KEY_PAGE_COUNT, 4);
         int page = clamp(prefs.getInt(Prefs.KEY_SAVED_PAGE, 0), 0, count - 1);
         float sensitivity = prefs.getFloat(Prefs.KEY_SWIPE_SENSITIVITY, 1.80f);
+        float startPhase = prefs.getFloat(Prefs.KEY_GLASS_START_PHASE_PX, Prefs.DEFAULT_GLASS_START_PHASE_PX);
         boolean debug = prefs.getBoolean(Prefs.KEY_SHOW_DEBUG, false);
 
         pagesValue.setText(String.valueOf(count));
         currentValue.setText((page + 1) + " / " + count);
         sensitivityValue.setText(String.format(Locale.US, "%.2f×", sensitivity));
+        if (startPhaseValue != null) startPhaseValue.setText(String.format(Locale.US, "%.0f px", startPhase));
         if (debugButton != null) {
             debugButton.setText(debug ? "ОТЛАДКА: ВКЛ" : "ОТЛАДКА: ВЫКЛ");
         }
