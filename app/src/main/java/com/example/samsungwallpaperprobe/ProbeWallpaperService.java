@@ -27,7 +27,7 @@ import java.util.Locale;
 import java.util.concurrent.locks.LockSupport;
 
 /**
- * v0.18: cached-layout bounds engine.
+ * v0.19: page-scoped cached-layout bounds engine.
  *
  * The real One UI icon bounds remain authoritative. Touch is re-enabled only as a high-rate
  * temporal bridge between real bounds samples; it never selects a page and never runs a virtual
@@ -558,7 +558,7 @@ public class ProbeWallpaperService extends WallpaperService {
                 debugPaint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
                 debugPaint.setTextSize(54f);
                 debugPaint.setColor(Color.WHITE);
-                debugCanvas.drawText("Bounds Engine v0.18", 38, 68, debugPaint);
+                debugCanvas.drawText("Bounds Engine v0.19", 38, 68, debugPaint);
                 debugPaint.setTypeface(android.graphics.Typeface.DEFAULT);
                 debugPaint.setTextSize(31f);
 

@@ -1,7 +1,7 @@
 package com.example.samsungwallpaperprobe;
 
 /**
- * v0.18 bridge between the One UI accessibility tracker and the wallpaper renderer.
+ * v0.19 bridge between the One UI accessibility tracker and the wallpaper renderer.
  *
  * The tracker caches a snapshot of ALL launcher icon-like nodes when Home becomes visible.
  * During motion it refreshes only one real AccessibilityNodeInfo (the anchor).  The wallpaper
@@ -77,14 +77,16 @@ public final class LauncherScrollBus {
         public final float height;
         public final String label;
         public final boolean movesWithPages;
+        public final int pageIndex; // -1 for dock / page-independent nodes
 
-        public IconBox(float worldCenterX, float centerY, float width, float height, String label, boolean movesWithPages) {
+        public IconBox(float worldCenterX, float centerY, float width, float height, String label, boolean movesWithPages, int pageIndex) {
             this.worldCenterX = worldCenterX;
             this.centerY = centerY;
             this.width = width;
             this.height = height;
             this.label = label == null ? "" : label;
             this.movesWithPages = movesWithPages;
+            this.pageIndex = pageIndex;
         }
     }
 

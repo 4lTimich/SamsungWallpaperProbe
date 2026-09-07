@@ -15,7 +15,7 @@ import java.util.HashMap;
 import java.util.Locale;
 
 /**
- * v0.18 real-bounds tracker.
+ * v0.19 real-bounds tracker.
  *
  * Full tree work is rare: once when Home becomes visible and when we need a new anchor.
  * At frame time we refresh ONE cached launcher node. A snapshot of all icon-like nodes is stored
@@ -26,6 +26,7 @@ public class LauncherAccessibilityService extends AccessibilityService {
     private static final long POLL_MS = 8L;          // request ~125 Hz; Samsung may publish less
     private static final long IDLE_MS = 120L;
     private static final long MIN_RESCAN_MS = 55L;
+    private static final long MIN_PREFETCH_SCAN_MS = 48L;
     private static final int MAX_TREE_NODES = 1800;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -47,6 +48,10 @@ public class LauncherAccessibilityService extends AccessibilityService {
     private long changeWindowStart = 0L;
     private int changeWindowCount = 0;
 
+    // Layout prefetch is intentionally sparse: a few scans per real swipe, never per frame.
+    private int prefetchPairKey = Integer.MIN_VALUE;
+    private int prefetchStage = -1;
+
     private final Runnable tracker = new Runnable() {
         @Override public void run() {
             if (!running) return;
@@ -63,9 +68,14 @@ public class LauncherAccessibilityService extends AccessibilityService {
             if (homeEntry || rescan) {
                 seenHomeEpoch = LauncherScrollBus.homeEpoch;
                 seenRescanGeneration = LauncherScrollBus.rescanGeneration;
-                fullScanAndAcquire(homeEntry, now);
-            } else if (!sampleAnchor(now) && now - lastFullScanMs >= MIN_RESCAN_MS) {
-                fullScanAndAcquire(false, now);
+                fullScanAndAcquire(now);
+            } else {
+                boolean sampled = sampleAnchor(now);
+                if (sampled) {
+                    maybePrefetchLayout(now);
+                } else if (now - lastFullScanMs >= MIN_RESCAN_MS) {
+                    fullScanAndAcquire(now);
+                }
             }
 
             handler.postDelayed(this, POLL_MS);
@@ -189,13 +199,13 @@ public class LauncherAccessibilityService extends AccessibilityService {
         // Reacquire before the anchor disappears too far. The new anchor's world coordinate is
         // built from the current real position, so the swap is continuous.
         if ((cx < -w * 0.10f || cx > w * 1.10f) && now - lastFullScanMs > 70L) {
-            fullScanAndAcquire(false, now);
+            fullScanAndAcquire(now);
         }
 
         return true;
     }
 
-    private void fullScanAndAcquire(boolean homeEntry, long now) {
+    private void fullScanAndAcquire(long now) {
         lastFullScanMs = now;
         LauncherScrollBus.layoutScans++;
         LauncherScrollBus.lastLayoutScanMs = now;
@@ -232,7 +242,7 @@ public class LauncherAccessibilityService extends AccessibilityService {
                     Math.max(0, prefs.getInt(Prefs.KEY_PAGE_COUNT, 4) - 1));
         }
 
-        publishIconSnapshot(icons, basisPos, w, homeEntry);
+        publishIconSnapshot(icons, basisPos, w);
 
         Candidate chosen = chooseAnchor(icons, w, h);
         if (chosen == null) {
@@ -240,6 +250,71 @@ public class LauncherAccessibilityService extends AccessibilityService {
             return;
         }
         acquire(chosen, basisPos, now, w);
+    }
+
+    /**
+     * One UI usually exposes the incoming page in the accessibility tree before the swipe
+     * finishes.  v0.18 waited until anchor reacquisition / page settle, which is why outlines
+     * could pop in late.  We do at most a few tree scans during a gesture and cache what appears.
+     */
+    private void maybePrefetchLayout(long now) {
+        if (!LauncherScrollBus.positionValid) return;
+
+        int pages = clampInt(prefs.getInt(Prefs.KEY_PAGE_COUNT, 4), 2, 9);
+        float pos = LauncherScrollBus.position;
+        int base = LauncherScrollBus.authoritativePage >= 0
+                ? clampInt(LauncherScrollBus.authoritativePage, 0, pages - 1)
+                : clampInt(Math.round(pos), 0, pages - 1);
+
+        float delta = pos - base;
+        float travel = Math.abs(delta);
+        if (travel < 0.045f) {
+            prefetchPairKey = Integer.MIN_VALUE;
+            prefetchStage = -1;
+            return;
+        }
+
+        int direction = delta > 0f ? 1 : -1;
+        int target = base + direction;
+        if (target < 0 || target >= pages) return;
+
+        int pairKey = base * 32 + target;
+        if (pairKey != prefetchPairKey) {
+            prefetchPairKey = pairKey;
+            prefetchStage = -1;
+        }
+
+        int stage = travel >= 0.40f ? 2 : (travel >= 0.20f ? 1 : (travel >= 0.075f ? 0 : -1));
+        if (stage <= prefetchStage) return;
+        if (now - lastFullScanMs < MIN_PREFETCH_SCAN_MS) return;
+
+        // Mark before scanning so a slow/expensive scan cannot be re-entered for the same stage.
+        prefetchStage = stage;
+        scanLayoutOnly(now);
+    }
+
+    private void scanLayoutOnly(long now) {
+        lastFullScanMs = now;
+        LauncherScrollBus.layoutScans++;
+        LauncherScrollBus.lastLayoutScanMs = now;
+
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return;
+        CharSequence pkg = root.getPackageName();
+        if (pkg == null || !LAUNCHER.contentEquals(pkg)) return;
+
+        int w = Math.max(1, getResources().getDisplayMetrics().widthPixels);
+        int h = Math.max(1, getResources().getDisplayMetrics().heightPixels);
+        ArrayList<Candidate> icons = collectIconCandidates(root, w, h);
+        if (icons.isEmpty()) return;
+
+        float basisPos = LauncherScrollBus.positionValid
+                ? LauncherScrollBus.position
+                : (LauncherScrollBus.authoritativePage >= 0
+                    ? LauncherScrollBus.authoritativePage
+                    : clampInt(prefs.getInt(Prefs.KEY_SAVED_PAGE, 0), 0,
+                        Math.max(0, prefs.getInt(Prefs.KEY_PAGE_COUNT, 4) - 1)));
+        publishIconSnapshot(icons, basisPos, w);
     }
 
     private ArrayList<Candidate> collectIconCandidates(AccessibilityNodeInfo root, int w, int h) {
@@ -273,7 +348,12 @@ public class LauncherAccessibilityService extends AccessibilityService {
             int replace = -1;
             for (int i = 0; i < out.size(); i++) {
                 Candidate old = out.get(i);
-                if (normalize(old.label).equals(normalize(c.label)) && overlapRatio(old.rect, c.rect) > 0.72f) {
+                float overlap = overlapRatio(old.rect, c.rect);
+                boolean sameLabel = normalize(old.label).equals(normalize(c.label));
+                boolean sameGeometry = Math.abs(old.rect.centerX() - c.rect.centerX()) <= 6
+                        && Math.abs(old.rect.centerY() - c.rect.centerY()) <= 6
+                        && overlap > 0.84f;
+                if ((sameLabel && overlap > 0.72f) || sameGeometry) {
                     replace = i;
                     break;
                 }
@@ -293,6 +373,10 @@ public class LauncherAccessibilityService extends AccessibilityService {
     private boolean looksLikeIconNode(AccessibilityNodeInfo n, Rect r, String label, int w, int h) {
         if (label.isEmpty()) return false;
         if (!n.isClickable()) return false;
+        if (!n.isVisibleToUser()) return false;
+        // Ignore stale hidden-page nodes that remain in One UI's tree with old bounds. Keep a
+        // small off-screen margin so an icon can be cached just before it visibly enters.
+        if (r.right < -w * 0.12f || r.left > w * 1.12f) return false;
         int rw = r.width(), rh = r.height();
         if (rw < w * 0.055f || rw > w * 0.42f) return false;
         if (rh < h * 0.035f || rh > h * 0.22f) return false;
@@ -332,43 +416,104 @@ public class LauncherAccessibilityService extends AccessibilityService {
         sampleAnchor(now);
     }
 
-    private void publishIconSnapshot(ArrayList<Candidate> icons, float basisPos, int w, boolean replace) {
-        ArrayList<LauncherScrollBus.IconBox> fresh = new ArrayList<>();
+    /**
+     * Store icon bounds in stable world coordinates.
+     *
+     * The important v0.19 change is that snapshots are PAGE-SCOPED. v0.18 blindly merged every
+     * later scan into one global list; after a page change that could keep stale nodes and then
+     * draw the old page's outlines on the new page. A settled scan replaces only that page, while
+     * a mid-swipe scan only adds/updates the visible portions of the incoming/outgoing pages.
+     */
+    private void publishIconSnapshot(ArrayList<Candidate> icons, float basisPos, int w) {
+        int pages = clampInt(prefs.getInt(Prefs.KEY_PAGE_COUNT, 4), 2, 9);
         int h = Math.max(1, getResources().getDisplayMetrics().heightPixels);
+        ArrayList<LauncherScrollBus.IconBox> fresh = new ArrayList<>();
+
         for (Candidate c : icons) {
             boolean moves = c.rect.centerY() <= h * 0.84f;
             float worldX = moves ? c.rect.centerX() + basisPos * w : c.rect.centerX();
-            fresh.add(new LauncherScrollBus.IconBox(
+            int pageIndex = -1;
+            if (moves) {
+                pageIndex = (int) Math.floor(worldX / Math.max(1f, (float) w));
+                if (pageIndex < 0 || pageIndex >= pages) continue;
+            }
+            addOrReplaceFresh(fresh, new LauncherScrollBus.IconBox(
                     worldX,
                     c.rect.centerY(),
                     c.rect.width(),
                     c.rect.height(),
                     c.label,
-                    moves));
+                    moves,
+                    pageIndex));
         }
 
-        if (!replace && LauncherScrollBus.iconSnapshot.length > 0) {
-            // Mid-swipe scans should ADD knowledge, not make old outlines disappear.
-            ArrayList<LauncherScrollBus.IconBox> merged = new ArrayList<>();
-            for (LauncherScrollBus.IconBox old : LauncherScrollBus.iconSnapshot) merged.add(old);
-            for (LauncherScrollBus.IconBox n : fresh) {
-                int hit = findSnapshotMatch(merged, n);
-                if (hit >= 0) merged.set(hit, n); else merged.add(n);
+        LauncherScrollBus.IconBox[] oldArray = LauncherScrollBus.iconSnapshot;
+        ArrayList<LauncherScrollBus.IconBox> merged = new ArrayList<>();
+        for (LauncherScrollBus.IconBox old : oldArray) merged.add(old);
+
+        boolean settled = Math.abs(basisPos - Math.round(basisPos)) < 0.065f;
+        int settledPage = clampInt(Math.round(basisPos), 0, pages - 1);
+
+        if (settled) {
+            // Replace the current page atomically. This makes manual "rescan" idempotent and
+            // prevents outlines from stacking on top of themselves.
+            for (int i = merged.size() - 1; i >= 0; i--) {
+                LauncherScrollBus.IconBox b = merged.get(i);
+                if (b.movesWithPages && b.pageIndex == settledPage) merged.remove(i);
             }
-            LauncherScrollBus.iconSnapshot = merged.toArray(new LauncherScrollBus.IconBox[0]);
-        } else {
-            LauncherScrollBus.iconSnapshot = fresh.toArray(new LauncherScrollBus.IconBox[0]);
         }
+
+        // The dock is page-independent. Any scan that sees dock icons refreshes the dock rather
+        // than accumulating another copy.
+        boolean freshHasDock = false;
+        for (LauncherScrollBus.IconBox b : fresh) if (!b.movesWithPages) { freshHasDock = true; break; }
+        if (freshHasDock) {
+            for (int i = merged.size() - 1; i >= 0; i--) {
+                if (!merged.get(i).movesWithPages) merged.remove(i);
+            }
+        }
+
+        for (LauncherScrollBus.IconBox n : fresh) {
+            int hit = findSnapshotMatch(merged, n);
+            if (hit >= 0) merged.set(hit, n); else merged.add(n);
+        }
+
+        // Final geometry-level de-duplication protects against Samsung exposing both a clickable
+        // wrapper and its clickable child for the same icon on successive scans.
+        ArrayList<LauncherScrollBus.IconBox> clean = new ArrayList<>();
+        for (LauncherScrollBus.IconBox n : merged) addOrReplaceFresh(clean, n);
+
+        LauncherScrollBus.iconSnapshot = clean.toArray(new LauncherScrollBus.IconBox[0]);
         LauncherScrollBus.iconSnapshotVersion++;
+    }
+
+    private void addOrReplaceFresh(ArrayList<LauncherScrollBus.IconBox> boxes, LauncherScrollBus.IconBox n) {
+        int hit = findSnapshotMatch(boxes, n);
+        if (hit < 0) {
+            boxes.add(n);
+            return;
+        }
+        LauncherScrollBus.IconBox old = boxes.get(hit);
+        float oldArea = Math.max(1f, old.width * old.height);
+        float newArea = Math.max(1f, n.width * n.height);
+        // Prefer the tighter rectangle when Samsung publishes a wrapper + child pair.
+        if (newArea <= oldArea * 1.06f) boxes.set(hit, n);
     }
 
     private int findSnapshotMatch(ArrayList<LauncherScrollBus.IconBox> boxes, LauncherScrollBus.IconBox n) {
         String nl = normalize(n.label);
         for (int i = 0; i < boxes.size(); i++) {
             LauncherScrollBus.IconBox o = boxes.get(i);
-            if (!normalize(o.label).equals(nl)) continue;
-            if (Math.abs(o.centerY - n.centerY) < Math.max(36f, n.height * 0.45f)
-                    && Math.abs(o.worldCenterX - n.worldCenterX) < Math.max(90f, n.width * 0.70f)) {
+            if (o.movesWithPages != n.movesWithPages) continue;
+            if (o.pageIndex != n.pageIndex) continue;
+
+            float dx = Math.abs(o.worldCenterX - n.worldCenterX);
+            float dy = Math.abs(o.centerY - n.centerY);
+            boolean sameLabel = normalize(o.label).equals(nl);
+            boolean sameSlot = dx < Math.max(34f, Math.min(o.width, n.width) * 0.42f)
+                    && dy < Math.max(34f, Math.min(o.height, n.height) * 0.34f);
+            if ((sameLabel && dx < Math.max(96f, n.width * 0.78f)
+                    && dy < Math.max(54f, n.height * 0.50f)) || sameSlot) {
                 return i;
             }
         }

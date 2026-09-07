@@ -76,12 +76,12 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView title = text("Iridescent Bounds Engine v0.18", 25f, Color.BLACK, true);
+        TextView title = text("Iridescent Bounds Engine v0.19", 25f, Color.BLACK, true);
         title.setGravity(Gravity.CENTER);
         root.addView(title, matchWrap());
 
         TextView body = text(
-                "v0.18 кэширует реальные bounds всех найденных иконок при выходе на Home, а во время свайпа обновляет только один anchor-node. " +
+                "v0.19 хранит bounds по страницам: пересъёмка заменяет текущую страницу вместо накопления дублей, а во время свайпа несколько редких prefetch-сканов заранее подхватывают входящую страницу. " +
                 "Сетка оставлена для старого стекла, но bounds-трекер от неё больше не зависит. Высокочастотные touch-события используются только как интерполяция между редкими реальными bounds — они не решают, какая страница выбрана.",
                 16f, Color.DKGRAY, false);
         body.setGravity(Gravity.CENTER);
@@ -99,10 +99,10 @@ public class MainActivity extends Activity {
         root.addView(accessibility, matchWrap());
 
         Button rescan = new Button(this);
-        rescan.setText("ПЕРЕСНЯТЬ РАСКЛАДКУ ПРИ ВЫХОДЕ НА HOME");
+        rescan.setText("ПЕРЕСНЯТЬ ТЕКУЩУЮ СТРАНИЦУ ПРИ ВЫХОДЕ НА HOME");
         rescan.setOnClickListener(v -> {
             LauncherScrollBus.requestRescan();
-            trackerStatus.setText("Пересканирование запрошено. Теперь просто вернись на рабочий стол.");
+            trackerStatus.setText("Пересъёмка текущей страницы запрошена. Вернись на рабочий стол — старый кэш этой страницы будет заменён, а не добавлен поверх.");
         });
         root.addView(rescan, matchWrap());
 
