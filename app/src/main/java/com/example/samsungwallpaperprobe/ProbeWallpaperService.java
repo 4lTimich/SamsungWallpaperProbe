@@ -425,75 +425,82 @@ public class ProbeWallpaperService extends WallpaperService {
 
         private void beginLauncher3Snap(boolean a11yAuthority, boolean fromCancel) {
             int w = Math.max(1, surfaceW);
-            float deltaPx = touchX - downX; // same sign convention as Launcher3 PagedView
+            float deltaPx = touchX - downX;
             float velocityPx = touchVelocityX;
 
-            releaseDistancePages = -deltaPx / w;
+            releaseDistancePages = -deltaPx / w;   // + = next page
             releaseVelocityPages = -velocityPx / w;
             releaseWasHorizontal = Math.abs(touchDx) > Math.abs(touchDy) * 0.72f;
 
-            boolean isSignificantMove = Math.abs(deltaPx) > w * 0.40f;
-            boolean passedSlop = totalMotionPx > touchSlopPx;
-            // Exact archived Samsung PagedView gate: a fling needs >25 px of total
-            // horizontal travel AND >500dp/s velocity. This prevents tiny fast flicks
-            // from being classified differently from the launcher.
-            boolean isFling = totalMotionPx > 25f && Math.abs(velocityPx) > flingThresholdPx;
-            boolean returnToOriginalPage = Math.abs(deltaPx) > w * 0.33f
-                    && Math.signum(velocityPx) != Math.signum(deltaPx)
-                    && isFling;
+            // v0.13: do not use the old 40% Samsung/Launcher3 threshold as the visual
+            // prediction. Modern One UI accepts ordinary page changes noticeably earlier,
+            // which made our glass sit on the old page and then "teleport" only after A11Y
+            // confirmed the new one. Instead use a conservative hybrid of final distance
+            // and RELEASE velocity. A tiny slow pull still returns to the current page.
+            float absDistance = Math.abs(releaseDistancePages);
+            float absVelocity = Math.abs(releaseVelocityPages);
+            boolean reverseAtRelease = absVelocity >= 0.24f
+                    && absDistance >= 0.05f
+                    && Math.signum(releaseVelocityPages) != Math.signum(releaseDistancePages);
 
-            int destination = currentPage;
-            if (fromCancel) {
-                destination = clampInt(Math.round(glassPosition), 0, pageCount - 1);
-            } else if (((isSignificantMove && deltaPx > 0f && !isFling)
-                    || (isFling && velocityPx > 0f)) && currentPage > 0) {
-                destination = returnToOriginalPage ? currentPage : currentPage - 1;
-            } else if (((isSignificantMove && deltaPx < 0f && !isFling)
-                    || (isFling && velocityPx < 0f)) && currentPage < pageCount - 1) {
-                destination = returnToOriginalPage ? currentPage : currentPage + 1;
-            } else {
-                // Launcher3 snapToDestination(): nearest page to current scroll center.
-                destination = clampInt(Math.round(glassPosition), 0, pageCount - 1);
+            int direction = 0;
+            if (releaseWasHorizontal && !reverseAtRelease) {
+                if (absDistance >= 0.28f) {
+                    direction = releaseDistancePages > 0f ? 1 : -1;
+                } else if (absDistance >= 0.07f && absVelocity >= 0.48f) {
+                    direction = releaseVelocityPages > 0f ? 1 : -1;
+                }
+            }
+
+            int destination = clampInt(currentPage + direction, 0, pageCount - 1);
+            if (fromCancel && direction == 0 && absDistance >= 0.34f) {
+                destination = clampInt(currentPage + (releaseDistancePages > 0f ? 1 : -1),
+                        0, pageCount - 1);
             }
 
             predictedReleasePage = destination;
-            releaseWasWeak = destination == currentPage && !isFling && !isSignificantMove;
+            releaseWasWeak = destination == currentPage
+                    && absDistance < 0.20f
+                    && absVelocity < 0.40f;
+
             int duration = launcherSnapDurationMs(destination, velocityPx);
-            startQuinticSnap(destination, duration, "PAGEDVIEW");
+            startQuinticSnap(destination, duration, "ONEUI PREDICT");
 
             if (a11yAuthority) {
                 awaitingA11yDecision = true;
                 a11yReleaseMs = SystemClock.uptimeMillis();
                 targetPage = destination;
-                offsetSource = "PAGEDVIEW + A11Y VERIFY";
+                offsetSource = "TOUCH SNAP + A11Y VERIFY";
                 lastDecision = String.format(Locale.US,
-                        "PRED %d  sig=%s fling=%s  %.0fpx/s  %dms",
-                        destination + 1, isSignificantMove, isFling, velocityPx, duration);
+                        "PRED %d d=%.2f v=%.2f %dms",
+                        destination + 1, releaseDistancePages, releaseVelocityPages, duration);
             } else {
                 currentPage = destination;
                 targetPage = destination;
-                offsetSource = "PAGEDVIEW MODEL";
+                offsetSource = "TOUCH SNAP MODEL";
                 lastDecision = String.format(Locale.US,
-                        "PAGE %d  sig=%s fling=%s  %dms",
-                        destination + 1, isSignificantMove, isFling, duration);
+                        "PAGE %d d=%.2f v=%.2f %dms",
+                        destination + 1, releaseDistancePages, releaseVelocityPages, duration);
                 saveStablePage();
             }
         }
 
         private int launcherSnapDurationMs(int destination, float velocityPx) {
+            // v0.13: the old archived PagedView duration could stretch to 750 ms. On the
+            // tested One UI this visually lagged behind the launcher after ACTION_UP.
+            // Keep the same quintic shape but use a shorter velocity-aware window.
             int w = Math.max(1, surfaceW);
-            float distancePx = Math.abs(destination - glassPosition) * w;
-            if (Math.abs(velocityPx) < minFlingPx) {
-                return 750; // Launcher3 config_pageSnapAnimationDuration
-            }
-            float half = w * 0.5f;
-            float ratio = Math.min(1f, distancePx / Math.max(1f, w));
-            float f = ratio - 0.5f;
-            f *= 0.3f * (float) Math.PI / 2f;
-            float influencedDistance = half + half * (float) Math.sin(f);
-            float v = Math.max(minSnapPx, Math.abs(velocityPx));
-            int duration = 4 * Math.round(1000f * Math.abs(influencedDistance / v));
-            return clampInt(duration, 180, 750);
+            float remainingPages = Math.abs(destination - glassPosition);
+            float speedPages = Math.abs(velocityPx) / Math.max(1f, w);
+
+            int duration;
+            if (speedPages >= 1.35f) duration = 210;
+            else if (speedPages >= 0.85f) duration = 245;
+            else if (speedPages >= 0.45f) duration = 285;
+            else duration = 330;
+
+            duration += Math.round(clamp(remainingPages - 0.35f, 0f, 0.65f) * 80f);
+            return clampInt(duration, 190, 390);
         }
 
         private void startQuinticSnap(int destination, int durationMs, String reason) {
@@ -531,18 +538,14 @@ public class ProbeWallpaperService extends WallpaperService {
         private float launcherLikeVisualDx() {
             if (!visualScrollStarted) return 0f;
 
-            // Start from exactly zero at the frame scrolling begins. The distance already
-            // travelled while crossing touch slop is blended back in over ~90 ms, so glass
-            // reaches the same phase as the icons without a visible 3–4 px teleport.
+            // v0.13: remove ALL velocity lead. Even measured delivery-lag compensation made
+            // the glass start a few pixels faster than the icon. The slop distance is still
+            // recovered, but very slowly, so there is no visible initial acceleration spike.
             float elapsedMs = Math.max(0f, SystemClock.uptimeMillis() - visualScrollStartMs);
-            float t = clamp(elapsedMs / 90f, 0f, 1f);
-            float smooth = t * t * (3f - 2f * t);
-            float visualDx = (touchX - visualScrollOriginX) + visualScrollCatchupPx * smooth;
-
-            // Keep only measured event-delivery compensation, and fade it in with the same
-            // ramp. v0.11 added a fixed +8 ms lead which was responsible for the startup hop.
-            float leadSec = clamp(touchDeliveryLagMs / 1000f, 0f, 0.018f) * smooth;
-            return visualDx + previewVelocityX * leadSec;
+            float t = clamp(elapsedMs / 320f, 0f, 1f);
+            // smootherstep: zero derivative at both ends -> no startup kick.
+            float smooth = t * t * t * (t * (t * 6f - 15f) + 10f);
+            return (touchX - visualScrollOriginX) + visualScrollCatchupPx * smooth;
         }
 
         private void updateAuthoritativeTouchPreview() {
@@ -683,6 +686,25 @@ public class ProbeWallpaperService extends WallpaperService {
                     // Do not commit a single early page-index packet. One UI can emit
                     // the next index while a slow partial drag is still springing back.
                     observeA11yPageCandidate(a11yTo, nowMs);
+
+                    // But for a clearly non-weak release, a post-release candidate in the
+                    // same direction is useful immediately as a VISUAL target. We still do
+                    // not save the page until the normal confirmation logic below. This is
+                    // what prevents "old page ... wait ... teleport to new page".
+                    int candidateDir = Integer.signum(a11yTo - currentPage);
+                    int releaseDir = Integer.signum((int) Math.signum(
+                            Math.abs(releaseVelocityPages) >= 0.34f
+                                    ? releaseVelocityPages : releaseDistancePages));
+                    boolean candidateDirectionFits = candidateDir != 0
+                            && candidateDir == releaseDir
+                            && releaseWasHorizontal
+                            && !releaseWasWeak;
+                    if (candidateDirectionFits && a11yTo != predictedReleasePage) {
+                        predictedReleasePage = a11yTo;
+                        targetPage = a11yTo;
+                        startQuinticSnap(a11yTo, 245, "A11Y EARLY TARGET");
+                    }
+
                     lastDecision = "A11Y PAGE CANDIDATE " + (a11yTo + 1)
                             + " x" + pendingA11yPageHits;
                 }
@@ -1059,13 +1081,12 @@ public class ProbeWallpaperService extends WallpaperService {
                 GLES20.glUniform2f(uSize, cw * w, ch * h);
                 GLES20.glUniform1f(uOpacity, opacity);
 
-                // Do not draw only floor/ceil. During snap overshoot or A11Y retargeting an
-                // icon from the previous page can still be partially visible while pos has
-                // already crossed the integer boundary. Keeping one extra page on each side
-                // prevents its glass from vanishing mid-transition.
-                int first = clampInt((int) Math.floor(pos) - 1, 0, pages - 1);
-                int last = clampInt((int) Math.ceil(pos) + 1, 0, pages - 1);
-                for (int page = first; page <= last; page++) {
+                // v0.13: render every non-empty configured page and let the per-cell
+                // screen bounds cull it. This is cheap for our tiny 4x6 grid and completely
+                // removes the last floor/ceil race where glass could disappear during an
+                // A11Y retarget or while the outgoing page was still a few pixels visible.
+                for (int page = 0; page < pages; page++) {
+                    if (pageCells[page] == null || pageCells[page].isEmpty()) continue;
                     drawGlassPage(w, h, pos, page, pageCells[page],
                             x0, y0, cw + gx, ch + gy, uCenter);
                 }

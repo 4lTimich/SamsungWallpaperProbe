@@ -1,12 +1,22 @@
-# Iridescent Wallpaper v0.12
+# Iridescent Wallpaper v0.13
 
-Focused regression-fix build.
+Точечная правка поведения стекла. Сетка и редактор НЕ менялись относительно v0.12/v0.8-восстановления.
 
-## Grid
-The grid editor/view code is restored to the v0.8 implementation. Existing v0.11 installs have incorrect geometry persisted, so v0.12 performs one one-time geometry restore to the exact v0.8 defaults. App-to-cell assignments and the editor screenshot are preserved. After that restore, the grid is not auto-migrated again.
+## Что исправлено
 
-## Motion fixes
-1. Glass no longer vanishes at page boundaries/overshoot. The renderer keeps one extra neighboring page alive on each side instead of drawing only floor/ceil pages.
-2. Removed the 3–4 px startup teleport. Crossing touch slop begins from a continuous zero displacement; the skipped slop distance is blended back over ~90 ms. The fixed +8 ms latency lead from v0.11 is removed; only measured event lag is compensated, and that compensation is ramped in.
+1. **Стекло больше не должно ждать на старой странице и потом резко догонять новую.**
+   - После отпускания используется более реалистичный для текущего One UI визуальный прогноз: 28% ширины для медленного перехода или быстрый release при хотя бы 7% пройденной ширины.
+   - Маленький медленный pull всё ещё возвращается на текущую страницу.
+   - Если accessibility после release быстро сообщает другую страницу и жест был явно не слабым, эта страница сразу становится только ВИЗУАЛЬНОЙ целью. Сохраняется она всё равно только после подтверждения.
+   - Quintic-анимация после release сокращена примерно до 190–390 мс вместо возможных 750 мс.
 
-The v0.11 Samsung/Launcher3-style page snap and A11Y final-page verification remain otherwise unchanged. Debug mode remains available.
+2. **Убрано ускорение стекла в первые миллисекунды свайпа.**
+   - Полностью удалена компенсация `velocity * deliveryLag`.
+   - Накопленный touch-slop возвращается через 320 мс с smootherstep (нулевая скорость в начале), поэтому больше не должно быть эффекта «стекло сначала едет быстрее иконки, затем синхронизируется».
+
+3. **Стекло не должно исчезать между страницами.**
+   - Renderer теперь рассматривает все непустые страницы каждый кадр и отбрасывает только реально ушедшие за экран ячейки. Нет зависимости от `floor/ceil(offset)`.
+
+## Важно
+
+Геометрия сетки, назначение приложений, редактор и v0.8 preset в этой версии не трогались.
