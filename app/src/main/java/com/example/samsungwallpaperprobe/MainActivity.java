@@ -27,17 +27,40 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        prefs = getSharedPreferences(ProbeWallpaperService.PREFS, MODE_PRIVATE);
+        prefs = getSharedPreferences(Prefs.PREFS, MODE_PRIVATE);
+        ensureDefaults();
+        buildUi();
+    }
 
-        if (!prefs.contains(ProbeWallpaperService.KEY_SWIPE_SENSITIVITY)) {
-            prefs.edit().putFloat(ProbeWallpaperService.KEY_SWIPE_SENSITIVITY, 1.65f).apply();
-        }
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (pagesValue != null) refreshValues();
+    }
 
+    private void ensureDefaults() {
+        SharedPreferences.Editor e = prefs.edit();
+        if (!prefs.contains(Prefs.KEY_PAGE_COUNT)) e.putInt(Prefs.KEY_PAGE_COUNT, 4);
+        if (!prefs.contains(Prefs.KEY_SAVED_PAGE)) e.putInt(Prefs.KEY_SAVED_PAGE, 0);
+        if (!prefs.contains(Prefs.KEY_SWIPE_SENSITIVITY)) e.putFloat(Prefs.KEY_SWIPE_SENSITIVITY, 1.80f);
+        if (!prefs.contains(Prefs.KEY_SHOW_DEBUG)) e.putBoolean(Prefs.KEY_SHOW_DEBUG, false);
+        if (!prefs.contains(Prefs.KEY_GRID_COLS)) e.putInt(Prefs.KEY_GRID_COLS, Prefs.DEFAULT_COLS);
+        if (!prefs.contains(Prefs.KEY_GRID_ROWS)) e.putInt(Prefs.KEY_GRID_ROWS, Prefs.DEFAULT_ROWS);
+        if (!prefs.contains(Prefs.KEY_GRID_X0)) e.putFloat(Prefs.KEY_GRID_X0, Prefs.DEFAULT_X0);
+        if (!prefs.contains(Prefs.KEY_GRID_Y0)) e.putFloat(Prefs.KEY_GRID_Y0, Prefs.DEFAULT_Y0);
+        if (!prefs.contains(Prefs.KEY_GRID_STEP_X)) e.putFloat(Prefs.KEY_GRID_STEP_X, Prefs.DEFAULT_STEP_X);
+        if (!prefs.contains(Prefs.KEY_GRID_STEP_Y)) e.putFloat(Prefs.KEY_GRID_STEP_Y, Prefs.DEFAULT_STEP_Y);
+        if (!prefs.contains(Prefs.KEY_GLASS_SIZE)) e.putFloat(Prefs.KEY_GLASS_SIZE, Prefs.DEFAULT_GLASS_SIZE);
+        if (!prefs.contains(Prefs.KEY_GLASS_OPACITY)) e.putFloat(Prefs.KEY_GLASS_OPACITY, Prefs.DEFAULT_GLASS_OPACITY);
+        e.apply();
+    }
+
+    private void buildUi() {
         int pad = dp(22);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setGravity(Gravity.CENTER_HORIZONTAL);
-        root.setPadding(pad, pad, pad, dp(36));
+        root.setPadding(pad, pad, pad, dp(40));
         root.setBackgroundColor(Color.rgb(248, 248, 248));
 
         ScrollView scroll = new ScrollView(this);
@@ -45,13 +68,12 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView title = text("Iridescent Engine v0.4", 25f, Color.BLACK, true);
+        TextView title = text("Iridescent Wallpaper Lab v0.5", 25f, Color.BLACK, true);
         title.setGravity(Gravity.CENTER);
         root.addView(title, matchWrap());
 
         TextView body = text(
-                "Теперь это уже не только тест. Фон сохраняет виртуальную страницу, сильнее реагирует на палец и рисует живые iridescent-поля под будущими полупрозрачными иконками.\n\n" +
-                "Сначала выставь страницы. Чувствительность можно менять без пересборки APK.",
+                "Теперь стекло рисуется самим wallpaper под выбранными ячейками. В редакторе можно настроить сетку почти пиксельно и назначить приложение каждой ячейке. Отладка сохранена.",
                 16f, Color.DKGRAY, false);
         body.setGravity(Gravity.CENTER);
         body.setPadding(0, dp(14), 0, dp(20));
@@ -69,19 +91,19 @@ public class MainActivity extends Activity {
         currentValue.setGravity(Gravity.CENTER);
         root.addView(makeIntegerStepper(currentValue, false), matchWrap());
 
-        TextView sensLabel = text("Чувствительность движения", 17f, Color.BLACK, true);
+        TextView sensLabel = text("Чувствительность движения фона", 17f, Color.BLACK, true);
         sensLabel.setPadding(0, dp(18), 0, 0);
         root.addView(sensLabel, matchWrap());
         sensitivityValue = text("", 27f, Color.BLACK, true);
         sensitivityValue.setGravity(Gravity.CENTER);
         root.addView(makeSensitivityStepper(), matchWrap());
 
-        TextView sensHint = text(
-                "1.00× = примерно как палец. 1.65× = текущий рекомендуемый вариант. Если хочешь сильнее — попробуй 1.80–2.00×.",
-                13.5f, Color.DKGRAY, false);
-        sensHint.setGravity(Gravity.CENTER);
-        sensHint.setPadding(0, dp(4), 0, dp(12));
-        root.addView(sensHint, matchWrap());
+        Button gridEditor = new Button(this);
+        gridEditor.setText("РЕДАКТОР СЕТКИ И СТЕКЛА");
+        gridEditor.setOnClickListener(v -> startActivity(new Intent(this, GridEditorActivity.class)));
+        LinearLayout.LayoutParams gridParams = matchWrap();
+        gridParams.setMargins(0, dp(20), 0, dp(8));
+        root.addView(gridEditor, gridParams);
 
         debugButton = new Button(this);
         debugButton.setOnClickListener(v -> toggleDebug());
@@ -91,7 +113,7 @@ public class MainActivity extends Activity {
         applyPosition.setText("СОХРАНИТЬ СТРАНИЦУ И НАСТРОЙКИ");
         applyPosition.setOnClickListener(v -> bumpGeneration());
         LinearLayout.LayoutParams buttonParams = matchWrap();
-        buttonParams.setMargins(0, dp(12), 0, dp(8));
+        buttonParams.setMargins(0, dp(10), 0, dp(8));
         root.addView(applyPosition, buttonParams);
 
         Button wallpaper = new Button(this);
@@ -103,7 +125,7 @@ public class MainActivity extends Activity {
         root.addView(wallpaper, matchWrap());
 
         TextView note = text(
-                "Практический тест иконок: следующим шагом мы ставим через Theme Park одну PNG-иконку с прозрачными участками. Если Samsung сохраняет alpha, живой цвет этих обоев будет виден прямо внутри её стекла — это и будет основа всего пака.",
+                "Важно: приложение не двигает настоящие иконки One UI. Оно двигает и калибрует только стекло под ними. Во время свайпа стеклянная сетка движется 1:1 со страницами, а цветной материал под ней может реагировать сильнее.",
                 14f, Color.DKGRAY, false);
         note.setGravity(Gravity.CENTER);
         note.setPadding(0, dp(18), 0, 0);
@@ -162,54 +184,54 @@ public class MainActivity extends Activity {
     }
 
     private void changePageCount(int delta) {
-        int oldCount = prefs.getInt(ProbeWallpaperService.KEY_PAGE_COUNT, 4);
+        int oldCount = prefs.getInt(Prefs.KEY_PAGE_COUNT, 4);
         int count = clamp(oldCount + delta, 2, 9);
-        int current = clamp(prefs.getInt(ProbeWallpaperService.KEY_SAVED_PAGE, 0), 0, count - 1);
+        int current = clamp(prefs.getInt(Prefs.KEY_SAVED_PAGE, 0), 0, count - 1);
         prefs.edit()
-                .putInt(ProbeWallpaperService.KEY_PAGE_COUNT, count)
-                .putInt(ProbeWallpaperService.KEY_SAVED_PAGE, current)
+                .putInt(Prefs.KEY_PAGE_COUNT, count)
+                .putInt(Prefs.KEY_SAVED_PAGE, current)
                 .apply();
         refreshValues();
     }
 
     private void changeCurrentPage(int delta) {
-        int count = prefs.getInt(ProbeWallpaperService.KEY_PAGE_COUNT, 4);
-        int current = clamp(prefs.getInt(ProbeWallpaperService.KEY_SAVED_PAGE, 0) + delta, 0, count - 1);
-        prefs.edit().putInt(ProbeWallpaperService.KEY_SAVED_PAGE, current).apply();
+        int count = prefs.getInt(Prefs.KEY_PAGE_COUNT, 4);
+        int current = clamp(prefs.getInt(Prefs.KEY_SAVED_PAGE, 0) + delta, 0, count - 1);
+        prefs.edit().putInt(Prefs.KEY_SAVED_PAGE, current).apply();
         refreshValues();
     }
 
     private void changeSensitivity(float delta) {
-        float current = prefs.getFloat(ProbeWallpaperService.KEY_SWIPE_SENSITIVITY, 1.65f);
+        float current = prefs.getFloat(Prefs.KEY_SWIPE_SENSITIVITY, 1.80f);
         float next = clamp(current + delta, 0.70f, 2.60f);
         next = Math.round(next * 10f) / 10f;
-        prefs.edit().putFloat(ProbeWallpaperService.KEY_SWIPE_SENSITIVITY, next).apply();
+        prefs.edit().putFloat(Prefs.KEY_SWIPE_SENSITIVITY, next).apply();
         refreshValues();
     }
 
     private void toggleDebug() {
-        boolean current = prefs.getBoolean(ProbeWallpaperService.KEY_SHOW_DEBUG, false);
-        prefs.edit().putBoolean(ProbeWallpaperService.KEY_SHOW_DEBUG, !current).apply();
-        refreshValues();
+        boolean current = prefs.getBoolean(Prefs.KEY_SHOW_DEBUG, false);
+        prefs.edit().putBoolean(Prefs.KEY_SHOW_DEBUG, !current).apply();
+        bumpGeneration();
     }
 
     private void bumpGeneration() {
-        int generation = prefs.getInt(ProbeWallpaperService.KEY_CONFIG_GENERATION, 0);
-        prefs.edit().putInt(ProbeWallpaperService.KEY_CONFIG_GENERATION, generation + 1).apply();
+        int generation = prefs.getInt(Prefs.KEY_CONFIG_GENERATION, 0);
+        prefs.edit().putInt(Prefs.KEY_CONFIG_GENERATION, generation + 1).apply();
         refreshValues();
     }
 
     private void refreshValues() {
-        int count = prefs.getInt(ProbeWallpaperService.KEY_PAGE_COUNT, 4);
-        int page = clamp(prefs.getInt(ProbeWallpaperService.KEY_SAVED_PAGE, 0), 0, count - 1);
-        float sensitivity = prefs.getFloat(ProbeWallpaperService.KEY_SWIPE_SENSITIVITY, 1.65f);
-        boolean debug = prefs.getBoolean(ProbeWallpaperService.KEY_SHOW_DEBUG, false);
+        int count = prefs.getInt(Prefs.KEY_PAGE_COUNT, 4);
+        int page = clamp(prefs.getInt(Prefs.KEY_SAVED_PAGE, 0), 0, count - 1);
+        float sensitivity = prefs.getFloat(Prefs.KEY_SWIPE_SENSITIVITY, 1.80f);
+        boolean debug = prefs.getBoolean(Prefs.KEY_SHOW_DEBUG, false);
 
         pagesValue.setText(String.valueOf(count));
         currentValue.setText((page + 1) + " / " + count);
         sensitivityValue.setText(String.format(Locale.US, "%.2f×", sensitivity));
         if (debugButton != null) {
-            debugButton.setText(debug ? "ДИАГНОСТИКА: ВКЛ" : "ДИАГНОСТИКА: ВЫКЛ");
+            debugButton.setText(debug ? "ОТЛАДКА: ВКЛ" : "ОТЛАДКА: ВЫКЛ");
         }
     }
 

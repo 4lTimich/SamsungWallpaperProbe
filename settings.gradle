@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "SamsungWallpaperProbe"
+rootProject.name = "IridescentWallpaper"
 include ':app'
