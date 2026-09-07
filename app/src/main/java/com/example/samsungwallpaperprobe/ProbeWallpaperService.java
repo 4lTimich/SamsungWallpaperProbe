@@ -16,35 +16,30 @@ import android.opengl.GLES20;
 import android.opengl.GLUtils;
 import android.os.SystemClock;
 import android.service.wallpaper.WallpaperService;
-import android.view.MotionEvent;
 import android.view.SurfaceHolder;
-import android.view.VelocityTracker;
-import android.view.ViewConfiguration;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.util.ArrayList;
 import java.util.Locale;
+import java.util.concurrent.locks.LockSupport;
 
 /**
- * v0.16: existing v0.15 motion kept intact; adds an experimental accessibility bounds probe.
+ * v0.17: bounds-only engine.
  *
- * Samsung One UI does not publish WallpaperService offsets on the tested device, and
- * accessibility scroll samples are too sparse for frame-by-frame rendering. While the
- * finger is down we therefore follow raw touch, with a tiny timestamp-based lead to
- * compensate delivery/render latency. On release we use the same decision thresholds,
- * velocity model and quintic snap curve used by Android Launcher3 PagedView. Accessibility
- * is kept only as a final-page correction channel, never as a continuous animation source.
+ * All old virtual-offset / touch-slop / predicted-fling / custom-spring code is removed.
+ * The wallpaper renders one continuous position published by LauncherAccessibilityService,
+ * which is derived from the real getBoundsInScreen() X coordinate of one launcher icon.
  */
 public class ProbeWallpaperService extends WallpaperService {
 
     @Override
     public Engine onCreateEngine() {
-        return new GpuEngine();
+        return new BoundsGpuEngine();
     }
 
-    private final class GpuEngine extends Engine {
+    private final class BoundsGpuEngine extends Engine {
         private final Object stateLock = new Object();
         private SharedPreferences prefs;
         private RenderThread renderThread;
@@ -53,106 +48,14 @@ public class ProbeWallpaperService extends WallpaperService {
         private volatile int surfaceW = 1;
         private volatile int surfaceH = 1;
 
-        // Persistent page state.
         private int pageCount = 4;
-        private int currentPage = 0;
-        private int targetPage = 0;
         private int lastConfigGeneration = -1;
-        private float swipeSensitivity = 1.80f;
         private boolean showDebug = false;
-        private float glassStartPhasePx = Prefs.DEFAULT_GLASS_START_PHASE_PX;
-
-        // Visual positions and their smooth targets.
-        private float virtualPosition = 0f;
-        private float glassPosition = 0f;
-        private float virtualTargetPosition = 0f;
-        private float glassTargetPosition = 0f;
-        private float visualVelocity = 0f;
-        private float glassVelocity = 0f;
+        private float displayPosition = 0f;
         private float motionEnergy = 0f;
+        private String source = "BOUNDS WAIT";
 
-        // Touch fallback state.
-        private boolean dragging = false;
-        private float downX = 0f;
-        private float downY = 0f;
-        private float touchX = 0f;
-        private float touchY = 0f;
-        private float touchDx = 0f;
-        private float touchDy = 0f;
-        private float touchVelocityX = 0f;
-        // High-rate velocity used ONLY for visual phase compensation while dragging.
-        // Unlike release velocity it must reverse sign immediately when the finger reverses.
-        private float previewVelocityX = 0f;
-        private float prevMoveX = 0f;
-        private long prevMoveMs = 0L;
-        private boolean visualScrollStarted = false;
-        private float visualScrollOriginX = 0f;
-        // Smoothly absorb the touch-slop distance instead of applying it as a one-frame jump.
-        private float visualScrollCatchupPx = 0f;
-        private long visualScrollStartMs = 0L;
-        private int gestureBasePage = 0;
-        private String lastDecision = "READY";
-
-        // Launcher3/PagedView gesture model (mirrors AOSP semantics).
-        private VelocityTracker velocityTracker;
-        private float totalMotionPx = 0f;
-        private int touchSlopPx = 1;
-        private int maxVelocityPx = 10000;
-        private float density = 1f;
-        private float flingThresholdPx = 500f;
-        private float minFlingPx = 250f;
-        private float minSnapPx = 1500f;
-        private float touchDeliveryLagMs = 0f;
-        private int predictedReleasePage = 0;
-
-        // Exact-style page snap instead of a generic spring. Launcher3 uses a quintic
-        // ease-out: (t-1)^5 + 1. A11Y may retarget it, but never drives frames directly.
-        private boolean snapAnimating = false;
-        private long snapStartMs = 0L;
-        private int snapDurationMs = 0;
-        private float snapStartGlass = 0f;
-        private float snapEndGlass = 0f;
-        private float snapStartBg = 0f;
-        private float snapEndBg = 0f;
-
-        // Accessibility real-offset state.
-        private long lastBusSequence = -1L;
-        private boolean realOffsetLocked = false;
-        private float realPosition = 0f;
-        private long lastRealEventMs = 0L;
-        private boolean realSettledForEvent = true;
-        private String offsetSource = "VIRTUAL TOUCH";
-        private int a11yScrollX = -1;
-        private int a11yMaxScrollX = -1;
-        private int a11yDeltaX = 0;
-        private int a11yFrom = -1;
-        private int a11yTo = -1;
-        private int a11yCount = -1;
-        private String a11yClass = "";
-        private String a11ySummary = "";
-
-        // v0.8 authoritative accessibility state. When the service is connected,
-        // the touch heuristic is NEVER allowed to commit a page change. Touch is
-        // only a temporary preview until One UI confirms the final page.
-        private boolean awaitingA11yDecision = false;
-        private long a11yReleaseMs = 0L;
-        private long lastA11yMotionMs = 0L;
-        private boolean a11yContinuousThisGesture = false;
-        private int a11yDeltaSign = 0;
-        private float glassVisibility = 1f;
-
-        // v0.10: page-index events from One UI can arrive before the launcher has
-        // actually settled. Keep them as candidates first; only a stable/credible
-        // candidate is allowed to become the persistent page.
-        private int pendingA11yPage = -1;
-        private int pendingA11yPageHits = 0;
-        private long pendingA11yPageMs = 0L;
-        private float releaseDistancePages = 0f;
-        private float releaseVelocityPages = 0f;
-        private boolean releaseWasWeak = true;
-        private boolean releaseWasHorizontal = true;
-
-        // Grid cache.
+        // Grid cache. Geometry is intentionally unchanged from the v0.8 branch.
         private int gridCols = Prefs.DEFAULT_COLS;
         private int gridRows = Prefs.DEFAULT_ROWS;
         private float gridX0 = Prefs.DEFAULT_X0;
@@ -189,32 +92,15 @@ public class ProbeWallpaperService extends WallpaperService {
                     if (Prefs.KEY_SHOW_DEBUG.equals(key)) {
                         showDebug = sharedPreferences.getBoolean(Prefs.KEY_SHOW_DEBUG, showDebug);
                     }
-                    if (Prefs.KEY_SWIPE_SENSITIVITY.equals(key)) {
-                        swipeSensitivity = clamp(sharedPreferences.getFloat(
-                                Prefs.KEY_SWIPE_SENSITIVITY, swipeSensitivity), 0.70f, 2.60f);
-                    }
-                    if (Prefs.KEY_GLASS_START_PHASE_PX.equals(key)) {
-                        glassStartPhasePx = clamp(sharedPreferences.getFloat(
-                                Prefs.KEY_GLASS_START_PHASE_PX, glassStartPhasePx), 0f, 12f);
-                    }
                 };
 
         @Override
         public void onCreate(SurfaceHolder holder) {
             super.onCreate(holder);
-            setTouchEventsEnabled(true);
+            // Bounds tracking is authoritative now. We deliberately do not request touch events.
+            setTouchEventsEnabled(false);
             setOffsetNotificationsEnabled(false);
             prefs = getSharedPreferences(Prefs.PREFS, Context.MODE_PRIVATE);
-            density = Math.max(0.5f, getResources().getDisplayMetrics().density);
-            ViewConfiguration vc = ViewConfiguration.get(ProbeWallpaperService.this);
-            // Samsung's own archived PagedView uses getScaledTouchSlop(), not
-            // getScaledPagingTouchSlop(). Matching this matters visually because the
-            // launcher does not start translating pages on the first pixel of a drag.
-            touchSlopPx = Math.max(1, vc.getScaledTouchSlop());
-            maxVelocityPx = Math.max(1000, vc.getScaledMaximumFlingVelocity());
-            flingThresholdPx = 500f * density;
-            minFlingPx = 250f * density;
-            minSnapPx = 1500f * density;
             Prefs.ensureV06GridDefaults(prefs,
                     getResources().getDisplayMetrics().widthPixels,
                     getResources().getDisplayMetrics().heightPixels);
@@ -225,31 +111,15 @@ public class ProbeWallpaperService extends WallpaperService {
         private void loadPersistentState(boolean forcePosition) {
             synchronized (stateLock) {
                 pageCount = clampInt(prefs.getInt(Prefs.KEY_PAGE_COUNT, 4), 2, 9);
-                swipeSensitivity = clamp(prefs.getFloat(Prefs.KEY_SWIPE_SENSITIVITY, 1.80f), 0.70f, 2.60f);
                 showDebug = prefs.getBoolean(Prefs.KEY_SHOW_DEBUG, false);
-                glassStartPhasePx = clamp(prefs.getFloat(Prefs.KEY_GLASS_START_PHASE_PX, Prefs.DEFAULT_GLASS_START_PHASE_PX), 0f, 12f);
                 int generation = prefs.getInt(Prefs.KEY_CONFIG_GENERATION, 0);
-                int saved = clampInt(prefs.getInt(Prefs.KEY_SAVED_PAGE, 0), 0, pageCount - 1);
                 if (forcePosition || generation != lastConfigGeneration) {
-                    currentPage = saved;
-                    targetPage = saved;
-                    virtualPosition = saved;
-                    glassPosition = saved;
-                    virtualTargetPosition = saved;
-                    glassTargetPosition = saved;
-                    realPosition = saved;
-                    visualVelocity = 0f;
-                    glassVelocity = 0f;
-                    dragging = false;
+                    int saved = clampInt(prefs.getInt(Prefs.KEY_SAVED_PAGE, 0), 0, pageCount - 1);
+                    if (!LauncherScrollBus.positionValid) displayPosition = saved;
                 }
                 lastConfigGeneration = generation;
                 gridDirty = true;
             }
-        }
-
-        private void saveStablePage() {
-            if (prefs == null || isPreview()) return;
-            prefs.edit().putInt(Prefs.KEY_SAVED_PAGE, currentPage).apply();
         }
 
         @Override
@@ -273,18 +143,19 @@ public class ProbeWallpaperService extends WallpaperService {
         public void onVisibilityChanged(boolean isVisible) {
             visible = isVisible;
             if (isVisible) {
+                LauncherScrollBus.onWallpaperVisible();
                 int generation = prefs.getInt(Prefs.KEY_CONFIG_GENERATION, lastConfigGeneration);
                 if (generation != lastConfigGeneration) loadPersistentState(false);
                 if (renderThread != null) renderThread.wakeUp();
             } else {
-                saveStablePage();
+                LauncherScrollBus.onWallpaperHidden();
             }
         }
 
         @Override
         public void onSurfaceDestroyed(SurfaceHolder holder) {
             visible = false;
-            saveStablePage();
+            LauncherScrollBus.onWallpaperHidden();
             if (renderThread != null) {
                 renderThread.requestStop();
                 try { renderThread.join(1500L); } catch (InterruptedException ignored) {}
@@ -295,11 +166,7 @@ public class ProbeWallpaperService extends WallpaperService {
 
         @Override
         public void onDestroy() {
-            saveStablePage();
-            if (velocityTracker != null) {
-                velocityTracker.recycle();
-                velocityTracker = null;
-            }
+            LauncherScrollBus.onWallpaperHidden();
             if (prefs != null) prefs.unregisterOnSharedPreferenceChangeListener(prefsListener);
             if (renderThread != null) {
                 renderThread.requestStop();
@@ -308,560 +175,29 @@ public class ProbeWallpaperService extends WallpaperService {
             super.onDestroy();
         }
 
-        @Override
-        public void onTouchEvent(MotionEvent event) {
-            super.onTouchEvent(event);
-            final long now = SystemClock.uptimeMillis();
+        private void consumeBoundsPosition(float dt) {
             synchronized (stateLock) {
-                touchX = event.getX();
-                touchY = event.getY();
-                touchDeliveryLagMs = clamp(now - event.getEventTime(), 0f, 32f);
-
-                if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
-                    if (velocityTracker == null) velocityTracker = VelocityTracker.obtain();
-                    else velocityTracker.clear();
-                }
-                if (velocityTracker != null) velocityTracker.addMovement(event);
-
-                switch (event.getActionMasked()) {
-                    case MotionEvent.ACTION_DOWN:
-                        dragging = true;
-                        gestureBasePage = currentPage;
-                        targetPage = currentPage;
-                        downX = touchX;
-                        downY = touchY;
-                        touchDx = 0f;
-                        touchDy = 0f;
-                        touchVelocityX = 0f;
-                        previewVelocityX = 0f;
-                        prevMoveX = touchX;
-                        prevMoveMs = now;
-                        visualScrollStarted = false;
-                        visualScrollOriginX = touchX;
-                        visualScrollCatchupPx = 0f;
-                        visualScrollStartMs = 0L;
-                        totalMotionPx = 0f;
-                        predictedReleasePage = currentPage;
-                        snapAnimating = false;
-                        visualVelocity = 0f;
-                        glassVelocity = 0f;
-                        awaitingA11yDecision = false;
-                        a11yContinuousThisGesture = false;
-                        a11yDeltaSign = 0;
-                        pendingA11yPage = -1;
-                        pendingA11yPageHits = 0;
-                        pendingA11yPageMs = 0L;
-                        releaseDistancePages = 0f;
-                        releaseVelocityPages = 0f;
-                        releaseWasWeak = true;
-                        releaseWasHorizontal = true;
-                        if (LauncherScrollBus.serviceConnected) {
-                            realPosition = currentPage;
-                            lastDecision = "A11Y AUTHORITY + TOUCH PREVIEW";
-                            offsetSource = "A11Y TOUCH";
-                        } else {
-                            lastDecision = "VIRTUAL TOUCH";
-                            offsetSource = "VIRTUAL TOUCH";
-                        }
-                        break;
-                    case MotionEvent.ACTION_MOVE:
-                        if (!dragging) break;
-                        touchDx = touchX - downX;
-                        touchDy = touchY - downY;
-                        long dtMs = now - prevMoveMs;
-                        float frameDx = touchX - prevMoveX;
-                        totalMotionPx += Math.abs(frameDx);
-                        if (dtMs > 0) {
-                            float instantVx = frameDx * 1000f / dtMs;
-                            touchVelocityX = touchVelocityX * 0.42f + instantVx * 0.58f;
-                            // For visual tracking, preserve reversals instead of letting an old
-                            // low-pass velocity pull the glass in the previous direction.
-                            if (Math.signum(instantVx) != Math.signum(previewVelocityX)
-                                    && Math.abs(instantVx) > 20f) {
-                                previewVelocityX = instantVx;
-                            } else {
-                                previewVelocityX = previewVelocityX * 0.18f + instantVx * 0.82f;
-                            }
-                        }
-
-                        // Samsung PagedView waits until horizontal motion crosses its normal
-                        // touch slop, then treats THAT point as the beginning of page movement.
-                        // Before this, icons themselves are still stationary, so our glass must
-                        // also stay stationary.
-                        if (!visualScrollStarted) {
-                            float absDx = Math.abs(touchX - downX);
-                            float absDy = Math.abs(touchY - downY);
-                            if (absDx > touchSlopPx && absDx > absDy) {
-                                visualScrollStarted = true;
-                                visualScrollOriginX = touchX;
-                                visualScrollCatchupPx = touchX - downX;
-                                visualScrollStartMs = now;
-                            }
-                        }
-
-                        prevMoveX = touchX;
-                        prevMoveMs = now;
-                        if (LauncherScrollBus.serviceConnected) {
-                            // v0.9: while the finger is physically down, TOUCH always wins
-                            // visually. Accessibility samples on One UI are too sparse/jagged
-                            // for direct rendering; they are still collected in the background
-                            // and become authoritative after release.
-                            updateAuthoritativeTouchPreview();
-                        } else {
-                            updateFallbackDraggedPositions();
-                        }
-                        break;
-                    case MotionEvent.ACTION_UP:
-                    case MotionEvent.ACTION_CANCEL:
-                        if (!dragging) break;
-                        touchDx = touchX - downX;
-                        touchDy = touchY - downY;
-                        if (velocityTracker != null) {
-                            velocityTracker.computeCurrentVelocity(1000, maxVelocityPx);
-                            touchVelocityX = velocityTracker.getXVelocity();
-                        }
-                        dragging = false;
-                        beginLauncher3Snap(LauncherScrollBus.serviceConnected,
-                                event.getActionMasked() == MotionEvent.ACTION_CANCEL);
-                        break;
-                }
-            }
-            if (renderThread != null) renderThread.wakeUp();
-        }
-
-        private void beginLauncher3Snap(boolean a11yAuthority, boolean fromCancel) {
-            int w = Math.max(1, surfaceW);
-            float deltaPx = touchX - downX;
-            float velocityPx = touchVelocityX;
-
-            releaseDistancePages = -deltaPx / w;
-            releaseVelocityPages = -velocityPx / w;
-            releaseWasHorizontal = Math.abs(touchDx) > Math.abs(touchDy) * 0.72f;
-
-            // Modern One UI switches pages earlier than the archived 40% PagedView gate.
-            // Use release distance + release velocity only for the VISUAL prediction;
-            // accessibility still verifies the final logical page.
-            float absDistance = Math.abs(releaseDistancePages);
-            float absVelocity = Math.abs(releaseVelocityPages);
-            boolean reverseAtRelease = absVelocity >= 0.24f
-                    && absDistance >= 0.05f
-                    && Math.signum(releaseVelocityPages) != Math.signum(releaseDistancePages);
-
-            int direction = 0;
-            if (releaseWasHorizontal && !reverseAtRelease) {
-                if (absDistance >= 0.28f) {
-                    direction = releaseDistancePages > 0f ? 1 : -1;
-                } else if (absDistance >= 0.07f && absVelocity >= 0.48f) {
-                    direction = releaseVelocityPages > 0f ? 1 : -1;
-                }
-            }
-
-            int destination = clampInt(currentPage + direction, 0, pageCount - 1);
-            if (fromCancel && direction == 0 && absDistance >= 0.34f) {
-                destination = clampInt(currentPage + (releaseDistancePages > 0f ? 1 : -1),
-                        0, pageCount - 1);
-            }
-
-            predictedReleasePage = destination;
-            releaseWasWeak = destination == currentPage
-                    && absDistance < 0.20f
-                    && absVelocity < 0.40f;
-
-            int duration = launcherSnapDurationMs(destination, velocityPx);
-            startQuinticSnap(destination, duration, "ONEUI PREDICT");
-
-            if (a11yAuthority) {
-                awaitingA11yDecision = true;
-                a11yReleaseMs = SystemClock.uptimeMillis();
-                targetPage = destination;
-                offsetSource = "TOUCH SNAP + A11Y VERIFY";
-                lastDecision = String.format(Locale.US,
-                        "PRED %d d=%.2f v=%.2f %dms",
-                        destination + 1, releaseDistancePages, releaseVelocityPages, duration);
-            } else {
-                currentPage = destination;
-                targetPage = destination;
-                offsetSource = "TOUCH SNAP MODEL";
-                lastDecision = String.format(Locale.US,
-                        "PAGE %d d=%.2f v=%.2f %dms",
-                        destination + 1, releaseDistancePages, releaseVelocityPages, duration);
-                saveStablePage();
-            }
-        }
-
-        private int launcherSnapDurationMs(int destination, float velocityPx) {
-            int w = Math.max(1, surfaceW);
-            float distancePx = Math.abs(destination - glassPosition) * w;
-            if (Math.abs(velocityPx) < minFlingPx) {
-                return 750; // Launcher3 config_pageSnapAnimationDuration
-            }
-            float half = w * 0.5f;
-            float ratio = Math.min(1f, distancePx / Math.max(1f, w));
-            float f = ratio - 0.5f;
-            f *= 0.3f * (float) Math.PI / 2f;
-            float influencedDistance = half + half * (float) Math.sin(f);
-            float v = Math.max(minSnapPx, Math.abs(velocityPx));
-            int duration = 4 * Math.round(1000f * Math.abs(influencedDistance / v));
-            return clampInt(duration, 180, 750);
-        }
-
-        private void startQuinticSnap(int destination, int durationMs, String reason) {
-            int dest = clampInt(destination, 0, pageCount - 1);
-            snapAnimating = true;
-            snapStartMs = SystemClock.uptimeMillis();
-            snapDurationMs = Math.max(1, durationMs);
-            snapStartGlass = glassPosition;
-            snapEndGlass = dest;
-            snapStartBg = virtualPosition;
-            snapEndBg = dest;
-            glassTargetPosition = dest;
-            virtualTargetPosition = dest;
-            visualVelocity = 0f;
-            glassVelocity = 0f;
-            if (reason != null && !reason.isEmpty()) lastDecision = reason + " -> " + (dest + 1);
-        }
-
-        private float quinticEaseOut(float t) {
-            t = clamp(t, 0f, 1f) - 1f;
-            return t * t * t * t * t + 1f;
-        }
-
-        private void observeA11yPageCandidate(int page, long nowMs) {
-            int candidate = clampInt(page, 0, pageCount - 1);
-            if (pendingA11yPage == candidate) {
-                pendingA11yPageHits++;
-            } else {
-                pendingA11yPage = candidate;
-                pendingA11yPageHits = 1;
-            }
-            pendingA11yPageMs = nowMs;
-        }
-
-        private float launcherLikeVisualDx() {
-            // v0.15: empirical One UI phase correction. The launcher icon begins a few
-            // physical pixels later than the raw WallpaperService touch stream. Previous
-            // versions tried to catch that distance up, which made glass move faster at
-            // the beginning and left a permanent 3–4 px lead. Instead we remove a small
-            // constant distance from the CURRENT drag direction. Once past that tiny
-            // deadzone, tracking is exactly 1:1 in both directions — no catch-up and no
-            // velocity/input-lag extrapolation.
-            float dx = touchX - downX;
-            float phase = clamp(glassStartPhasePx, 0f, 12f);
-            float abs = Math.abs(dx);
-            if (abs <= phase) return 0f;
-            return Math.signum(dx) * (abs - phase);
-        }
-
-        private void updateAuthoritativeTouchPreview() {
-            int w = Math.max(1, surfaceW);
-            float rawPageDelta = -launcherLikeVisualDx() / w;
-            float glass = applyEdgeRubber(gestureBasePage + rawPageDelta, 0.20f);
-            float bg = applyEdgeRubber(gestureBasePage + rawPageDelta * swipeSensitivity, 0.28f);
-            // Direct assignment is intentional: MotionEvent is the highest-rate signal we
-            // have while dragging and follows reversals immediately. No A11Y jitter here.
-            glassPosition = glass;
-            glassTargetPosition = glass;
-            virtualPosition = bg;
-            virtualTargetPosition = bg;
-            glassVelocity = 0f;
-            visualVelocity = 0f;
-            offsetSource = visualScrollStarted
-                    ? "SAMSUNG TOUCH + A11Y VERIFY"
-                    : "SAMSUNG TOUCH SLOP";
-            // Page state intentionally unchanged. Accessibility alone can commit it.
-        }
-
-        private void updateFallbackDraggedPositions() {
-            int w = Math.max(1, surfaceW);
-            float rawPageDelta = -launcherLikeVisualDx() / w;
-            virtualPosition = applyEdgeRubber(gestureBasePage + rawPageDelta * swipeSensitivity, 0.28f);
-            glassPosition = applyEdgeRubber(gestureBasePage + rawPageDelta, 0.20f);
-            virtualTargetPosition = virtualPosition;
-            glassTargetPosition = glassPosition;
-            offsetSource = visualScrollStarted ? "SAMSUNG TOUCH MODEL" : "SAMSUNG TOUCH SLOP";
-        }
-
-        private void finishFallbackGesture(boolean fromCancel) {
-            beginLauncher3Snap(false, fromCancel);
-        }
-
-        private float applyEdgeRubber(float raw, float strength) {
-            if (raw < 0f) return -rubberBand(-raw, strength);
-            if (raw > pageCount - 1f) return (pageCount - 1f) + rubberBand(raw - (pageCount - 1f), strength);
-            return raw;
-        }
-
-        private float rubberBand(float beyond, float strength) {
-            return beyond * strength / (1f + beyond * 1.55f);
-        }
-
-        private void pollAccessibilityRealOffset(long nowMs) {
-            long seq = LauncherScrollBus.sequence;
-            if (seq == lastBusSequence) {
-                handleA11yQuietPeriod(nowMs);
-                return;
-            }
-            lastBusSequence = seq;
-            a11yScrollX = LauncherScrollBus.scrollX;
-            a11yMaxScrollX = LauncherScrollBus.maxScrollX;
-            a11yDeltaX = LauncherScrollBus.deltaX;
-            a11yFrom = LauncherScrollBus.fromIndex;
-            a11yTo = LauncherScrollBus.toIndex;
-            a11yCount = LauncherScrollBus.itemCount;
-            a11yClass = LauncherScrollBus.className;
-            a11ySummary = LauncherScrollBus.summary;
-
-            if (!LauncherScrollBus.serviceConnected) {
-                realOffsetLocked = false;
-                awaitingA11yDecision = false;
-                a11yContinuousThisGesture = false;
-                offsetSource = "VIRTUAL TOUCH";
-                return;
-            }
-
-            final boolean isScrollEvent = LauncherScrollBus.eventType
-                    == android.view.accessibility.AccessibilityEvent.TYPE_VIEW_SCROLLED;
-            final float w = Math.max(1f, surfaceW);
-
-            // Best case: One UI exposes an absolute horizontal scroll position.
-            // v0.9 never copies the sparse sample straight into glassPosition. During
-            // touch we render touch 1:1; after release this becomes a smooth target.
-            if (isScrollEvent && a11yMaxScrollX > 0 && a11yScrollX >= 0 && pageCount > 1) {
-                float stepPx = a11yMaxScrollX / (float) (pageCount - 1);
-                boolean plausible = stepPx >= w * 0.45f && stepPx <= w * 1.85f
-                        && a11yScrollX <= a11yMaxScrollX + w * 0.25f;
-                if (plausible) {
-                    float p = clamp(a11yScrollX / stepPx, 0f, pageCount - 1f);
-                    synchronized (stateLock) {
-                        realPosition = p;
-                        // Do not render this sparse accessibility sample. It is evidence
-                        // only; visible motion is generated by PagedView physics.
-                        if (!dragging) offsetSource = "PAGEDVIEW + A11Y REAL";
-                        realOffsetLocked = true;
-                        a11yContinuousThisGesture = true;
-                        lastA11yMotionMs = nowMs;
-                        lastRealEventMs = nowMs;
-                        realSettledForEvent = false;
-                        lastDecision = dragging ? "TOUCH 1:1 / A11Y OBSERVED" : "ONE UI ABSOLUTE TARGET";
+                long now = SystemClock.uptimeMillis();
+                if (LauncherScrollBus.serviceConnected
+                        && LauncherScrollBus.positionValid
+                        && now - LauncherScrollBus.positionUptimeMs < 100L) {
+                    // Direct real coordinate. No homemade easing and no touch prediction.
+                    displayPosition = LauncherScrollBus.position;
+                    source = "BOUNDS REAL";
+                } else if (LauncherScrollBus.authoritativePage >= 0) {
+                    // If the anchor is being reacquired, hold the last known settled page instead
+                    // of inventing a transition.
+                    if (!LauncherScrollBus.positionValid) {
+                        displayPosition = LauncherScrollBus.authoritativePage;
                     }
-                    handleA11yQuietPeriod(nowMs);
-                    return;
-                }
-            }
-
-            // Second-best case: One UI exposes only scrollDeltaX. Integrate it into an
-            // observed target, then interpolate at render rate. This removes the 5–15 Hz
-            // staircase that was visible in v0.8 when samples were rendered directly.
-            if (isScrollEvent && a11yDeltaX != 0 && Math.abs(a11yDeltaX) <= w * 1.50f) {
-                synchronized (stateLock) {
-                    if (a11yDeltaSign == 0) {
-                        float expected = Math.abs(touchVelocityX) > 30f ? -touchVelocityX : -touchDx;
-                        if (Math.abs(expected) > 8f) {
-                            a11yDeltaSign = ((expected > 0f) == (a11yDeltaX > 0)) ? 1 : -1;
-                        } else {
-                            a11yDeltaSign = 1;
-                        }
-                    }
-                    if (!a11yContinuousThisGesture) {
-                        realPosition = dragging ? gestureBasePage : glassPosition;
-                    }
-                    realPosition = applyEdgeRubber(
-                            realPosition + (a11yDeltaX / w) * a11yDeltaSign, 0.20f);
-                    // Do not use sparse scrollDeltaX as a frame source. It only helps
-                    // validate the eventual page decision.
-                    if (!dragging) offsetSource = "PAGEDVIEW + A11Y DELTA";
-                    realOffsetLocked = true;
-                    a11yContinuousThisGesture = true;
-                    lastA11yMotionMs = nowMs;
-                    lastRealEventMs = nowMs;
-                    realSettledForEvent = false;
-                    lastDecision = dragging ? "TOUCH 1:1 / A11Y DELTA OBS" : "ONE UI DELTA TARGET";
-                }
-            }
-
-            // Authoritative final page. Only accept it from an actual scroll event.
-            // Unlike v0.7, this is the ONLY thing (besides a truly settled continuous
-            // scroll coordinate) that can commit a new page while accessibility is on.
-            boolean postReleaseEvent = !awaitingA11yDecision
-                    || LauncherScrollBus.eventUptimeMs >= a11yReleaseMs - 30L;
-            if (isScrollEvent && !dragging && postReleaseEvent
-                    && a11yCount == pageCount && a11yTo >= 0 && a11yTo < pageCount) {
-                synchronized (stateLock) {
-                    // Do not commit a single early page-index packet. One UI can emit
-                    // the next index while a slow partial drag is still springing back.
-                    observeA11yPageCandidate(a11yTo, nowMs);
-
-                    int candidateDir = Integer.signum(a11yTo - currentPage);
-                    float releaseSignal = Math.abs(releaseVelocityPages) >= 0.34f
-                            ? releaseVelocityPages : releaseDistancePages;
-                    int releaseDir = releaseSignal > 0f ? 1 : (releaseSignal < 0f ? -1 : 0);
-                    boolean candidateDirectionFits = candidateDir != 0
-                            && candidateDir == releaseDir
-                            && releaseWasHorizontal
-                            && !releaseWasWeak;
-                    if (candidateDirectionFits && a11yTo != predictedReleasePage) {
-                        predictedReleasePage = a11yTo;
-                        targetPage = a11yTo;
-                        startQuinticSnap(a11yTo, 320, "A11Y EARLY TARGET");
-                    }
-
-                    lastDecision = "A11Y PAGE CANDIDATE " + (a11yTo + 1)
-                            + " x" + pendingA11yPageHits;
-                }
-            }
-
-            handleA11yQuietPeriod(nowMs);
-        }
-
-        private void commitAuthoritativePage(int page, String reason) {
-            int settled = clampInt(page, 0, pageCount - 1);
-            currentPage = settled;
-            targetPage = settled;
-            realPosition = settled;
-            // Accessibility verifies only the destination. If it disagrees with our
-            // PagedView prediction, retarget from the CURRENT rendered position with
-            // the same quintic curve instead of jumping or feeding sparse samples.
-            if (Math.abs(glassPosition - settled) > 0.002f) {
-                startQuinticSnap(settled, 260, "A11Y CORRECT");
-            } else {
-                glassPosition = settled;
-                virtualPosition = settled;
-                glassTargetPosition = settled;
-                virtualTargetPosition = settled;
-                snapAnimating = false;
-            }
-            awaitingA11yDecision = false;
-            realSettledForEvent = true;
-            realOffsetLocked = true;
-            a11yContinuousThisGesture = false;
-            pendingA11yPage = -1;
-            pendingA11yPageHits = 0;
-            pendingA11yPageMs = 0L;
-            offsetSource = "PAGEDVIEW + A11Y PAGE";
-            lastDecision = reason + " ✓";
-            LauncherScrollBus.authoritativePage = settled;
-            LauncherScrollBus.authoritativePageUptimeMs = SystemClock.uptimeMillis();
-            saveStablePage();
-        }
-
-        private void handleA11yQuietPeriod(long nowMs) {
-            if (!LauncherScrollBus.serviceConnected) return;
-
-            // Best evidence: continuous scroll coordinates actually came to rest very
-            // close to a page. This can commit without any page-index heuristic.
-            if (false && a11yContinuousThisGesture && !dragging
-                    && nowMs - lastA11yMotionMs > 170L) {
-                int nearest = clampInt(Math.round(realPosition), 0, pageCount - 1);
-                if (Math.abs(realPosition - nearest) < 0.085f) {
-                    synchronized (stateLock) {
-                        commitAuthoritativePage(nearest, "A11Y MOTION SETTLED " + (nearest + 1));
-                    }
-                    return;
-                }
-            }
-
-            // Debounce One UI's page-index signal. The key fix for v0.10: a tiny slow
-            // drag cannot switch our logical page just because one premature toIndex
-            // packet said "next page".
-            if (!dragging && pendingA11yPage >= 0
-                    && nowMs - pendingA11yPageMs > 145L) {
-                int candidate = pendingA11yPage;
-                boolean sameAsCurrent = candidate == currentPage;
-                boolean continuousSupports = a11yContinuousThisGesture
-                        && Math.abs(realPosition - candidate) < 0.18f;
-                boolean directionSupports = candidate != currentPage
-                        && releaseWasHorizontal
-                        && Integer.signum(candidate - currentPage)
-                        == Integer.signum((int) Math.signum(
-                                Math.abs(releaseVelocityPages) >= 0.34f
-                                        ? releaseVelocityPages : releaseDistancePages));
-                boolean predictedMatch = candidate == predictedReleasePage;
-                boolean strongRelease = !releaseWasWeak && directionSupports;
-                boolean repeated = pendingA11yPageHits >= 2;
-
-                // Our release model mirrors Launcher3 PagedView. A candidate matching that
-                // model can be accepted quickly. A disagreement must be repeated/stable.
-                if (sameAsCurrent || (predictedMatch && (repeated || nowMs - a11yReleaseMs > 180L))
-                        || continuousSupports
-                        || (strongRelease && repeated && nowMs - a11yReleaseMs > 240L)) {
-                    synchronized (stateLock) {
-                        commitAuthoritativePage(candidate, "ONE UI CONFIRMED " + (candidate + 1));
-                    }
-                    return;
+                    source = LauncherScrollBus.serviceConnected ? "BOUNDS HOLD" : "SERVICE OFF";
+                } else {
+                    source = LauncherScrollBus.serviceConnected ? "NO ANCHOR" : "SERVICE OFF";
                 }
 
-                // Weak release + contradictory next-page candidate: discard it. Keep
-                // waiting briefly in case One UI emits the corrected current page.
-                if (releaseWasWeak && candidate != currentPage
-                        && nowMs - a11yReleaseMs > 260L) {
-                    pendingA11yPage = -1;
-                    pendingA11yPageHits = 0;
-                    pendingA11yPageMs = 0L;
-                    glassTargetPosition = currentPage;
-                    virtualTargetPosition = currentPage;
-                    offsetSource = "A11Y REJECT FALSE PAGE";
-                    lastDecision = "WEAK RELEASE — IGNORE EARLY PAGE INDEX";
-                }
-            }
-
-            // No credible One UI confirmation: trust the Launcher3-compatible model.
-            // This avoids returning to the wrong page merely because accessibility stayed quiet.
-            if (awaitingA11yDecision && nowMs - a11yReleaseMs > 620L
-                    && nowMs - lastA11yMotionMs > 190L) {
-                synchronized (stateLock) {
-                    int fallback = clampInt(predictedReleasePage, 0, pageCount - 1);
-                    currentPage = fallback;
-                    targetPage = fallback;
-                    realPosition = fallback;
-                    if (Math.abs(glassPosition - fallback) > 0.002f) {
-                        startQuinticSnap(fallback, 220, "MODEL TIMEOUT");
-                    }
-                    awaitingA11yDecision = false;
-                    pendingA11yPage = -1;
-                    pendingA11yPageHits = 0;
-                    pendingA11yPageMs = 0L;
-                    offsetSource = "PAGEDVIEW TIMEOUT";
-                    lastDecision = "A11Y QUIET — TRUST MODEL PAGE " + (fallback + 1);
-                    saveStablePage();
-                }
-            }
-        }
-
-        private void advanceFallbackPhysics(float dt) {
-            synchronized (stateLock) {
-                if (!dragging) {
-                    if (snapAnimating) {
-                        float t = (SystemClock.uptimeMillis() - snapStartMs)
-                                / (float) Math.max(1, snapDurationMs);
-                        float q = quinticEaseOut(t);
-                        glassPosition = snapStartGlass + (snapEndGlass - snapStartGlass) * q;
-                        virtualPosition = snapStartBg + (snapEndBg - snapStartBg) * q;
-                        if (t >= 1f) {
-                            glassPosition = snapEndGlass;
-                            virtualPosition = snapEndBg;
-                            glassTargetPosition = snapEndGlass;
-                            virtualTargetPosition = snapEndBg;
-                            snapAnimating = false;
-                        }
-                    } else {
-                        // Only tiny residual corrections use the spring now. Normal page motion
-                        // is the launcher-style quintic snap above.
-                        float bgD = virtualTargetPosition - virtualPosition;
-                        float glassD = glassTargetPosition - glassPosition;
-                        if (Math.abs(bgD) > 0.0008f) virtualPosition += bgD * clamp(dt * 18f, 0f, 1f);
-                        if (Math.abs(glassD) > 0.0007f) glassPosition += glassD * clamp(dt * 22f, 0f, 1f);
-                    }
-                }
-
-                float touchSpeed = Math.abs(touchVelocityX) / Math.max(1f, surfaceW);
-                float snapSpeed = snapAnimating
-                        ? Math.abs(snapEndBg - snapStartBg) * 1000f / Math.max(1, snapDurationMs)
-                        : 0f;
-                float desired = dragging ? clamp(touchSpeed * 0.42f, 0f, 1f)
-                        : clamp(snapSpeed * 0.50f, 0f, 1f);
-                float response = desired > motionEnergy ? 12f : 4.3f;
-                motionEnergy += (desired - motionEnergy) * clamp(dt * response, 0f, 1f);
-                glassVisibility += (1f - glassVisibility) * clamp(dt * 14f, 0f, 1f);
+                float desiredEnergy = clamp(Math.abs(LauncherScrollBus.velocityPagesPerSec) * 0.34f, 0f, 1f);
+                float response = desiredEnergy > motionEnergy ? 16f : 5f;
+                motionEnergy += (desiredEnergy - motionEnergy) * clamp(dt * response, 0f, 1f);
             }
         }
 
@@ -880,6 +216,7 @@ public class ProbeWallpaperService extends WallpaperService {
                 gapX = clamp(prefs.getFloat(Prefs.KEY_GAP_X, Prefs.DEFAULT_GAP_X), 0f, 0.40f);
                 gapY = clamp(prefs.getFloat(Prefs.KEY_GAP_Y, Prefs.DEFAULT_GAP_Y), 0f, 0.30f);
                 glassOpacity = clamp(prefs.getFloat(Prefs.KEY_GLASS_OPACITY, Prefs.DEFAULT_GLASS_OPACITY), 0.05f, 0.95f);
+
                 cellsByPage = (ArrayList<Cell>[]) new ArrayList[pageCount];
                 for (int p = 0; p < pageCount; p++) {
                     ArrayList<Cell> cells = new ArrayList<>();
@@ -896,6 +233,8 @@ public class ProbeWallpaperService extends WallpaperService {
         }
 
         private final class RenderThread extends Thread {
+            private static final long TARGET_FRAME_NS = 8_333_333L; // 120 Hz
+
             private final SurfaceHolder holder;
             private volatile boolean running = true;
             private final Object waitLock = new Object();
@@ -905,7 +244,6 @@ public class ProbeWallpaperService extends WallpaperService {
             private EGLSurface eglSurface = EGL14.EGL_NO_SURFACE;
 
             private int bgProgram, glassProgram, texProgram;
-            private int quadBuffer;
             private FloatBuffer quad;
             private int debugTexture = 0;
             private Bitmap debugBitmap;
@@ -918,18 +256,12 @@ public class ProbeWallpaperService extends WallpaperService {
             private float measuredFps = 0f;
 
             RenderThread(SurfaceHolder holder) {
-                super("IridescentGL");
+                super("IridescentGL120");
                 this.holder = holder;
             }
 
-            void requestStop() {
-                running = false;
-                wakeUp();
-            }
-
-            void wakeUp() {
-                synchronized (waitLock) { waitLock.notifyAll(); }
-            }
+            void requestStop() { running = false; wakeUp(); }
+            void wakeUp() { synchronized (waitLock) { waitLock.notifyAll(); } }
 
             @Override
             public void run() {
@@ -941,7 +273,7 @@ public class ProbeWallpaperService extends WallpaperService {
                 while (running) {
                     if (!visible) {
                         synchronized (waitLock) {
-                            try { waitLock.wait(80L); } catch (InterruptedException ignored) {}
+                            try { waitLock.wait(100L); } catch (InterruptedException ignored) {}
                         }
                         lastNs = System.nanoTime();
                         nextFrameNs = lastNs;
@@ -956,21 +288,18 @@ public class ProbeWallpaperService extends WallpaperService {
                     if (generation != lastConfigGeneration) loadPersistentState(false);
                     if (gridDirty) rebuildGridCache();
 
-                    pollAccessibilityRealOffset(SystemClock.uptimeMillis());
-                    advanceFallbackPhysics(dt);
+                    consumeBoundsPosition(dt);
                     render(nowNs);
                     if (!EGL14.eglSwapBuffers(eglDisplay, eglSurface)) break;
                     updateFps(nowNs);
 
-                    nextFrameNs += 16_666_667L;
+                    // eglSwapBuffers normally blocks to vsync. The cap below only prevents a
+                    // non-blocking driver from running the wallpaper faster than 120 Hz.
+                    nextFrameNs += TARGET_FRAME_NS;
                     long sleepNs = nextFrameNs - System.nanoTime();
-                    if (sleepNs > 1_000_000L) {
-                        try {
-                            long ms = sleepNs / 1_000_000L;
-                            int ns = (int) (sleepNs % 1_000_000L);
-                            Thread.sleep(ms, ns);
-                        } catch (InterruptedException ignored) {}
-                    } else if (sleepNs < -50_000_000L) {
+                    if (sleepNs > 300_000L) {
+                        LockSupport.parkNanos(sleepNs);
+                    } else if (sleepNs < -40_000_000L) {
                         nextFrameNs = System.nanoTime();
                     }
                 }
@@ -985,7 +314,7 @@ public class ProbeWallpaperService extends WallpaperService {
                 if (!EGL14.eglInitialize(eglDisplay, version, 0, version, 1)) return false;
 
                 int[] attrib = {
-                        EGL14.EGL_RENDERABLE_TYPE, 4, // EGL_OPENGL_ES2_BIT
+                        EGL14.EGL_RENDERABLE_TYPE, 4,
                         EGL14.EGL_RED_SIZE, 8,
                         EGL14.EGL_GREEN_SIZE, 8,
                         EGL14.EGL_BLUE_SIZE, 8,
@@ -996,19 +325,22 @@ public class ProbeWallpaperService extends WallpaperService {
                 int[] num = new int[1];
                 if (!EGL14.eglChooseConfig(eglDisplay, attrib, 0, configs, 0, 1, num, 0) || num[0] == 0) return false;
 
-                int[] ctxAttrib = {0x3098, 2, EGL14.EGL_NONE}; // EGL_CONTEXT_CLIENT_VERSION
+                int[] ctxAttrib = {0x3098, 2, EGL14.EGL_NONE};
                 eglContext = EGL14.eglCreateContext(eglDisplay, configs[0], EGL14.EGL_NO_CONTEXT, ctxAttrib, 0);
                 if (eglContext == EGL14.EGL_NO_CONTEXT) return false;
 
                 int[] surfAttrib = {EGL14.EGL_NONE};
                 eglSurface = EGL14.eglCreateWindowSurface(eglDisplay, configs[0], holder.getSurface(), surfAttrib, 0);
                 if (eglSurface == EGL14.EGL_NO_SURFACE) return false;
-                return EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
+                if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) return false;
+                EGL14.eglSwapInterval(eglDisplay, 1);
+                return true;
             }
 
             private void initGl() {
                 float[] verts = {-1f,-1f, 1f,-1f, -1f,1f, 1f,1f};
-                quad = ByteBuffer.allocateDirect(verts.length * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
+                quad = ByteBuffer.allocateDirect(verts.length * 4)
+                        .order(ByteOrder.nativeOrder()).asFloatBuffer();
                 quad.put(verts).position(0);
 
                 bgProgram = buildProgram(VS_BG, FS_BG);
@@ -1038,26 +370,24 @@ public class ProbeWallpaperService extends WallpaperService {
                 GLES20.glClearColor(0.01f, 0.01f, 0.03f, 1f);
                 GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
 
-                float bgPos, glassPos, energy, opacity, visibility, x0, y0, cw, ch, gx, gy;
+                float pos, energy, opacity, x0, y0, cw, ch, gx, gy;
                 int pages;
                 ArrayList<Cell>[] pageCells;
                 boolean debug;
                 synchronized (stateLock) {
-                    bgPos = virtualPosition;
-                    glassPos = glassPosition;
+                    pos = displayPosition;
                     energy = motionEnergy;
                     opacity = glassOpacity;
-                    visibility = glassVisibility;
                     x0 = gridX0; y0 = gridY0; cw = cellWidth; ch = cellHeight; gx = gapX; gy = gapY;
                     pages = pageCount;
                     pageCells = cellsByPage;
                     debug = showDebug;
                 }
 
-                drawBackground(w, h, nowNs / 1_000_000_000f, bgPos, energy);
-                if (pageCells != null) drawGlass(w, h, glassPos, pages, pageCells, x0, y0, cw, ch, gx, gy, opacity * visibility);
-                if (debug && LauncherScrollBus.boundsFound
-                        && SystemClock.uptimeMillis() - LauncherScrollBus.boundsUptimeMs < 250L) {
+                drawBackground(w, h, nowNs / 1_000_000_000f, pos, energy);
+                if (pageCells != null) drawGlass(w, h, pos, pages, pageCells, x0, y0, cw, ch, gx, gy, opacity);
+                if (debug && LauncherScrollBus.positionValid
+                        && SystemClock.uptimeMillis() - LauncherScrollBus.positionUptimeMs < 120L) {
                     drawBoundsMarker(w, h);
                 }
                 if (debug) drawDebug(w, h);
@@ -1085,34 +415,25 @@ public class ProbeWallpaperService extends WallpaperService {
                 GLES20.glUniform2f(uSize, cw * w, ch * h);
                 GLES20.glUniform1f(uOpacity, opacity);
 
-                // v0.15: draw all non-empty configured pages. With a 4x6 grid this is
-                // cheap on GPU and guarantees that an outgoing/incoming glass pad cannot
-                // disappear just because the logical page target changed mid-animation.
+                // All configured pages are cheap enough at 4x6 and guarantee continuity.
                 for (int page = 0; page < pages; page++) {
                     if (pageCells[page] == null || pageCells[page].isEmpty()) continue;
-                    drawGlassPage(w, h, pos, page, pageCells[page],
-                            x0, y0, cw + gx, ch + gy, uCenter);
-                }
-            }
-
-            private void drawGlassPage(int w, int h, float pos, int page, ArrayList<Cell> cells,
-                                       float x0, float y0, float stepX, float stepY, int uCenter) {
-                if (cells == null) return;
-                float pageShift = (page - pos) * w;
-                for (Cell cell : cells) {
-                    float cx = (x0 + cell.col * stepX) * w + pageShift;
-                    float cy = (y0 + cell.row * stepY) * h;
-                    if (cx < -w * 0.25f || cx > w * 1.25f || cy < -h * 0.15f || cy > h * 1.15f) continue;
-                    GLES20.glUniform2f(uCenter, cx, cy);
-                    GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+                    float pageShift = (page - pos) * w;
+                    for (Cell cell : pageCells[page]) {
+                        float cx = (x0 + cell.col * (cw + gx)) * w + pageShift;
+                        float cy = (y0 + cell.row * (ch + gy)) * h;
+                        if (cx < -w * 0.35f || cx > w * 1.35f || cy < -h * 0.15f || cy > h * 1.15f) continue;
+                        GLES20.glUniform2f(uCenter, cx, cy);
+                        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+                    }
                 }
             }
 
             private void drawBoundsMarker(int w, int h) {
-                int left = LauncherScrollBus.boundsLeft;
-                int top = LauncherScrollBus.boundsTop;
-                int right = LauncherScrollBus.boundsRight;
-                int bottom = LauncherScrollBus.boundsBottom;
+                int left = LauncherScrollBus.anchorLeft;
+                int top = LauncherScrollBus.anchorTop;
+                int right = LauncherScrollBus.anchorRight;
+                int bottom = LauncherScrollBus.anchorBottom;
                 float bw = Math.max(10f, right - left);
                 float bh = Math.max(10f, bottom - top);
                 float cx = (left + right) * 0.5f;
@@ -1129,7 +450,7 @@ public class ProbeWallpaperService extends WallpaperService {
 
             private void drawDebug(int w, int h) {
                 long now = SystemClock.uptimeMillis();
-                if (now - lastDebugUploadMs > 220L) {
+                if (now - lastDebugUploadMs > 140L) {
                     lastDebugUploadMs = now;
                     updateDebugBitmap();
                     GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, debugTexture);
@@ -1154,38 +475,38 @@ public class ProbeWallpaperService extends WallpaperService {
                 debugPaint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
                 debugPaint.setTextSize(54f);
                 debugPaint.setColor(Color.WHITE);
-                debugCanvas.drawText("Bounds Probe v0.16", 38, 68, debugPaint);
+                debugCanvas.drawText("Bounds Engine v0.17", 38, 68, debugPaint);
                 debugPaint.setTypeface(android.graphics.Typeface.DEFAULT);
-                debugPaint.setTextSize(36f);
+                debugPaint.setTextSize(31f);
 
-                String line1, line2, line3, line4, line5, line6, line7;
+                long age = Math.max(0L, SystemClock.uptimeMillis() - LauncherScrollBus.positionUptimeMs);
+                String l1, l2, l3, l4, l5, l6, l7;
                 synchronized (stateLock) {
-                    line1 = String.format(Locale.US, "FPS %.1f   SOURCE %s", measuredFps, offsetSource);
-                    line2 = String.format(Locale.US, "BG %.3f→%.3f  GLASS %.3f→%.3f  P %d/%d", virtualPosition, virtualTargetPosition, glassPosition, glassTargetPosition, currentPage + 1, pageCount);
-                    long boundsAge = Math.max(0L, SystemClock.uptimeMillis() - LauncherScrollBus.boundsUptimeMs);
-                    line3 = LauncherScrollBus.boundsFound
-                            ? String.format(Locale.US, "BOUNDS %s X=%d Y=%d  %dx%d age=%dms",
-                                    LauncherScrollBus.boundsAnchor, LauncherScrollBus.boundsCenterX, LauncherScrollBus.boundsCenterY,
-                                    LauncherScrollBus.boundsRight - LauncherScrollBus.boundsLeft,
-                                    LauncherScrollBus.boundsBottom - LauncherScrollBus.boundsTop, boundsAge)
-                            : "BOUNDS NOT FOUND: " + LauncherScrollBus.boundsAnchor;
-                    line4 = String.format(Locale.US, "samples=%d changes=%d  node=%s",
-                            LauncherScrollBus.boundsSamples, LauncherScrollBus.boundsChanges, trim(LauncherScrollBus.boundsNodeText, 34));
-                    line5 = String.format(Locale.US, "A11Y x=%d max=%d dx=%d", a11yScrollX, a11yMaxScrollX, a11yDeltaX);
-                    line6 = String.format(Locale.US, "idx %d>%d count=%d  cand=%d x%d",
-                            a11yFrom, a11yTo, a11yCount,
-                            pendingA11yPage < 0 ? 0 : pendingA11yPage + 1, pendingA11yPageHits);
-                    line7 = trim(String.format(Locale.US, "start %.0fpx slop %dpx | %s",
-                            glassStartPhasePx, touchSlopPx, lastDecision), 72);
+                    l1 = String.format(Locale.US, "FPS %.1f/120  TRACK %.1fHz  %s", measuredFps, LauncherScrollBus.trackerHz, source);
+                    l2 = String.format(Locale.US, "POS %.4f  PAGE %d/%d  v=%.3f", displayPosition,
+                            LauncherScrollBus.authoritativePage < 0 ? 0 : LauncherScrollBus.authoritativePage + 1,
+                            pageCount, LauncherScrollBus.velocityPagesPerSec);
+                    l3 = String.format(Locale.US, "ANCHOR %s  p%d r%d c%d", trim(LauncherScrollBus.anchorLabel, 28),
+                            LauncherScrollBus.anchorPage + 1, LauncherScrollBus.anchorRow + 1, LauncherScrollBus.anchorCol + 1);
+                    l4 = String.format(Locale.US, "X %d  rest %.1f  dx %.1f  age %dms",
+                            LauncherScrollBus.anchorCenterX, LauncherScrollBus.anchorRestX,
+                            LauncherScrollBus.anchorCenterX - LauncherScrollBus.anchorRestX, age);
+                    l5 = String.format(Locale.US, "snapshot %d/%d  scans %d  reacq %d",
+                            LauncherScrollBus.visibleSlotsInSnapshot, LauncherScrollBus.configuredSlots,
+                            LauncherScrollBus.layoutScans, LauncherScrollBus.anchorReacquires);
+                    l6 = String.format(Locale.US, "bias %.1f, %.1f  samples %d  changes %d",
+                            LauncherScrollBus.layoutBiasX, LauncherScrollBus.layoutBiasY,
+                            LauncherScrollBus.boundsSamples, LauncherScrollBus.boundsChanges);
+                    l7 = trim("STATE " + LauncherScrollBus.trackerState, 70);
                 }
-                debugPaint.setTextSize(32f);
-                debugPaint.setColor(Color.rgb(145, 255, 180)); debugCanvas.drawText(line1, 38, 112, debugPaint);
-                debugPaint.setColor(Color.rgb(185, 220, 255)); debugCanvas.drawText(line2, 38, 156, debugPaint);
-                debugPaint.setColor(Color.rgb(255, 235, 125)); debugCanvas.drawText(line3, 38, 200, debugPaint);
-                debugPaint.setColor(Color.WHITE); debugCanvas.drawText(line4, 38, 244, debugPaint);
-                debugCanvas.drawText(line5, 38, 288, debugPaint);
-                debugCanvas.drawText(line6, 38, 332, debugPaint);
-                debugPaint.setColor(Color.rgb(255, 226, 150)); debugCanvas.drawText(line7, 38, 376, debugPaint);
+
+                debugPaint.setColor(Color.rgb(145, 255, 180)); debugCanvas.drawText(l1, 38, 112, debugPaint);
+                debugPaint.setColor(Color.rgb(185, 220, 255)); debugCanvas.drawText(l2, 38, 156, debugPaint);
+                debugPaint.setColor(Color.rgb(255, 235, 125)); debugCanvas.drawText(l3, 38, 200, debugPaint);
+                debugPaint.setColor(Color.WHITE); debugCanvas.drawText(l4, 38, 244, debugPaint);
+                debugCanvas.drawText(l5, 38, 288, debugPaint);
+                debugCanvas.drawText(l6, 38, 332, debugPaint);
+                debugPaint.setColor(Color.rgb(255, 226, 150)); debugCanvas.drawText(l7, 38, 376, debugPaint);
             }
 
             private void bindQuad(int program, String attr) {
@@ -1205,7 +526,8 @@ public class ProbeWallpaperService extends WallpaperService {
                 int[] ok = new int[1];
                 GLES20.glGetProgramiv(p, GLES20.GL_LINK_STATUS, ok, 0);
                 if (ok[0] == 0) throw new RuntimeException("GL link: " + GLES20.glGetProgramInfoLog(p));
-                GLES20.glDeleteShader(v); GLES20.glDeleteShader(f);
+                GLES20.glDeleteShader(v);
+                GLES20.glDeleteShader(f);
                 return p;
             }
 
@@ -1246,8 +568,13 @@ public class ProbeWallpaperService extends WallpaperService {
             return s.length() <= max ? s : s.substring(0, max);
         }
 
-        private int clampInt(int value, int min, int max) { return Math.max(min, Math.min(max, value)); }
-        private float clamp(float value, float min, float max) { return Math.max(min, Math.min(max, value)); }
+        private int clampInt(int value, int min, int max) {
+            return Math.max(min, Math.min(max, value));
+        }
+
+        private float clamp(float value, float min, float max) {
+            return Math.max(min, Math.min(max, value));
+        }
 
         private static final String VS_BG =
                 "attribute vec2 aPos; varying vec2 vUv; void main(){ vUv=aPos*0.5+0.5; gl_Position=vec4(aPos,0.0,1.0); }";

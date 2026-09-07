@@ -1,61 +1,87 @@
 package com.example.samsungwallpaperprobe;
 
 /**
- * Tiny in-process bridge between the opt-in accessibility service and the
- * wallpaper renderer. It stores only launcher scroll metadata; no UI content
- * from other apps is requested or retained.
+ * v0.17 bridge between the One UI accessibility tracker and the wallpaper renderer.
+ *
+ * There is deliberately no virtual-scroll model here. The accessibility service tracks
+ * one real launcher icon and publishes the continuous page position derived from that
+ * icon's getBoundsInScreen() coordinate. The wallpaper only consumes that position.
  */
 public final class LauncherScrollBus {
     private LauncherScrollBus() {}
 
     public static volatile boolean serviceConnected = false;
-    public static volatile long sequence = 0L;
-    public static volatile long eventUptimeMs = 0L;
-    public static volatile int eventType = 0;
-    public static volatile int scrollX = -1;
-    public static volatile int scrollY = -1;
-    public static volatile int maxScrollX = -1;
-    public static volatile int maxScrollY = -1;
-    public static volatile int deltaX = 0;
-    public static volatile int deltaY = 0;
-    public static volatile int fromIndex = -1;
-    public static volatile int toIndex = -1;
-    public static volatile int itemCount = -1;
-    public static volatile String className = "";
-    public static volatile String summary = "";
+    public static volatile boolean wallpaperVisible = false;
+    public static volatile boolean homeActive = false;
 
+    // Home-entry/layout rescan handshake. Wallpaper increments this when it becomes visible.
+    public static volatile long homeEpoch = 0L;
+    public static volatile long rescanGeneration = 0L;
 
-    // v0.16: experimental AccessibilityNodeInfo bounds probe.
-    public static volatile long boundsSequence = 0L;
-    public static volatile boolean boundsFound = false;
-    public static volatile long boundsUptimeMs = 0L;
-    public static volatile String boundsAnchor = "";
-    public static volatile int boundsLeft = 0;
-    public static volatile int boundsTop = 0;
-    public static volatile int boundsRight = 0;
-    public static volatile int boundsBottom = 0;
-    public static volatile int boundsCenterX = 0;
-    public static volatile int boundsCenterY = 0;
+    // Continuous real position from bounds tracking. 0 = page 1, 1 = page 2, etc.
+    public static volatile boolean positionValid = false;
+    public static volatile float position = 0f;
+    public static volatile float velocityPagesPerSec = 0f;
+    public static volatile long positionUptimeMs = 0L;
+    public static volatile long positionSequence = 0L;
+
+    // Cached anchor metadata.
+    public static volatile String anchorPackage = "";
+    public static volatile String anchorLabel = "";
+    public static volatile int anchorPage = -1;
+    public static volatile int anchorRow = -1;
+    public static volatile int anchorCol = -1;
+    public static volatile int anchorLeft = 0;
+    public static volatile int anchorTop = 0;
+    public static volatile int anchorRight = 0;
+    public static volatile int anchorBottom = 0;
+    public static volatile int anchorCenterX = 0;
+    public static volatile int anchorCenterY = 0;
+    public static volatile float anchorRestX = 0f;
+    public static volatile float anchorRestY = 0f;
     public static volatile long boundsSamples = 0L;
     public static volatile long boundsChanges = 0L;
-    public static volatile String boundsNodeText = "";
+    public static volatile long anchorReacquires = 0L;
 
-    // Last page confirmed by One UI accessibility data. Zero-based.
-    // Kept in-process so the grid editor can open directly on the real page.
+    // Snapshot/cache diagnostics. A full tree scan is intentionally rare.
+    public static volatile int configuredSlots = 0;
+    public static volatile int visibleSlotsInSnapshot = 0;
+    public static volatile long layoutScans = 0L;
+    public static volatile long lastLayoutScanMs = 0L;
+    public static volatile float layoutBiasX = 0f;
+    public static volatile float layoutBiasY = 0f;
+
+    // Effective high-rate sample frequency.
+    public static volatile float trackerHz = 0f;
+
+    // Stable page inferred from whichever assigned icon is currently at rest.
     public static volatile int authoritativePage = -1;
     public static volatile long authoritativePageUptimeMs = 0L;
 
-    public static void resetEventValues() {
-        scrollX = -1;
-        scrollY = -1;
-        maxScrollX = -1;
-        maxScrollY = -1;
-        deltaX = 0;
-        deltaY = 0;
-        fromIndex = -1;
-        toIndex = -1;
-        itemCount = -1;
-        className = "";
-        summary = "";
+    // Human-readable state for debug UI.
+    public static volatile String trackerState = "WAITING";
+
+    public static void onWallpaperVisible() {
+        wallpaperVisible = true;
+        homeEpoch++;
+        rescanGeneration++;
+    }
+
+    public static void onWallpaperHidden() {
+        wallpaperVisible = false;
+    }
+
+    public static void requestRescan() {
+        rescanGeneration++;
+    }
+
+    public static void clearTracking(String state) {
+        positionValid = false;
+        trackerState = state;
+        anchorPackage = "";
+        anchorLabel = "";
+        anchorPage = -1;
+        anchorRow = -1;
+        anchorCol = -1;
     }
 }
