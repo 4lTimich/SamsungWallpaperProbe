@@ -27,11 +27,11 @@ import java.util.Locale;
 import java.util.concurrent.locks.LockSupport;
 
 /**
- * v0.20: dual-anchor cached-layout bounds engine.
+ * v0.21: immutable settled-page cache + real bounds engine.
  *
- * Two real One UI icon bounds are authoritative: left/bottom and right/top. Touch remains only
- * a temporal bridge between real bounds samples; it never selects a page or simulates launcher
- * physics. The cached icon layout and old manual glass grid are both retained.
+ * Each tracked icon has immutable (pageIndex, resting X/Y) captured only while its page is settled.
+ * Real bounds directly reconstruct absolute page position. Mid-swipe scans never mutate layout.
+ * The old manual glass grid remains available as a fallback.
  */
 public class ProbeWallpaperService extends WallpaperService {
 
@@ -106,7 +106,7 @@ public class ProbeWallpaperService extends WallpaperService {
             super.onCreate(holder);
             // Bounds remains authoritative. Touch only fills the milliseconds between two real
             // bounds samples and never decides page state.
-            setTouchEventsEnabled(true);
+            setTouchEventsEnabled(false);
             setOffsetNotificationsEnabled(false);
             prefs = getSharedPreferences(Prefs.PREFS, Context.MODE_PRIVATE);
             Prefs.ensureV06GridDefaults(prefs,
@@ -221,54 +221,30 @@ public class ProbeWallpaperService extends WallpaperService {
         private void consumeBoundsPosition(float dt) {
             synchronized (stateLock) {
                 long now = SystemClock.uptimeMillis();
-                int w = Math.max(1, surfaceW);
-
                 if (LauncherScrollBus.serviceConnected
                         && LauncherScrollBus.positionValid
-                        && now - LauncherScrollBus.positionUptimeMs < 140L) {
+                        && now - LauncherScrollBus.positionUptimeMs < 150L) {
 
                     float realPos = LauncherScrollBus.position;
+                    long ageMs = Math.max(0L, now - LauncherScrollBus.lastChangedUptimeMs);
+                    float v = LauncherScrollBus.velocityPagesPerSec;
 
-                    // While the finger is down, bridge between two REAL bounds samples using
-                    // the finger displacement since the exact touch X captured with the last
-                    // changed bounds sample. This does not predict touch-slop or page choice.
-                    if (LauncherScrollBus.touchActive
-                            && LauncherScrollBus.touchWasActiveAtLastBoundsChange
-                            && LauncherScrollBus.lastChangedUptimeMs > 0L
-                            && now - LauncherScrollBus.lastChangedUptimeMs < 90L) {
-                        float touchDx = LauncherScrollBus.touchX - LauncherScrollBus.touchXAtLastBoundsChange;
-                        displayPosition = LauncherScrollBus.lastChangedPosition - touchDx / w;
-                        source = "BOUNDS + TOUCH BRIDGE";
-                    } else if (!LauncherScrollBus.touchActive
-                            && LauncherScrollBus.lastChangedUptimeMs > 0L) {
-                        // Samsung often exposes changed bounds at ~15-30 Hz even if refresh() is
-                        // called >100 Hz. Predict only a very short distance from the last real
-                        // sample so the 120-Hz renderer does not visually stair-step. Every real
-                        // sample immediately corrects this prediction.
-                        long ageMs = Math.max(0L, now - LauncherScrollBus.lastChangedUptimeMs);
-                        float v = LauncherScrollBus.velocityPagesPerSec;
-                        if (ageMs <= 42L && Math.abs(v) > 0.015f) {
-                            float t = ageMs / 1000f;
-                            float predicted = LauncherScrollBus.lastChangedPosition + v * t;
-                            // Keep prediction tightly bounded to avoid inventing a page.
-                            float maxLead = 0.085f;
-                            displayPosition = clamp(predicted, realPos - maxLead, realPos + maxLead);
-                            source = "BOUNDS RESAMPLED";
-                        } else {
-                            displayPosition = realPos;
-                            source = "BOUNDS REAL";
-                        }
+                    // Bounds often change at ~20-30 Hz. The cache/coordinate model is now exact;
+                    // this tiny prediction only fills the display interval between two real samples.
+                    // It is capped hard and every real bounds change snaps the predictor back to truth.
+                    if (ageMs <= 34L && Math.abs(v) > 0.012f) {
+                        float predicted = LauncherScrollBus.lastChangedPosition + v * (ageMs / 1000f);
+                        displayPosition = clamp(predicted, realPos - 0.055f, realPos + 0.055f);
+                        source = "SETTLED CACHE + REAL BOUNDS";
                     } else {
                         displayPosition = realPos;
-                        source = "BOUNDS REAL";
+                        source = "SETTLED CACHE REAL";
                     }
                 } else if (LauncherScrollBus.authoritativePage >= 0) {
-                    if (!LauncherScrollBus.positionValid) {
-                        displayPosition = LauncherScrollBus.authoritativePage;
-                    }
-                    source = LauncherScrollBus.serviceConnected ? "BOUNDS HOLD" : "SERVICE OFF";
+                    if (!LauncherScrollBus.positionValid) displayPosition = LauncherScrollBus.authoritativePage;
+                    source = LauncherScrollBus.serviceConnected ? "CACHE HOLD" : "SERVICE OFF";
                 } else {
-                    source = LauncherScrollBus.serviceConnected ? "NO ANCHOR" : "SERVICE OFF";
+                    source = LauncherScrollBus.serviceConnected ? "NO KNOWN ANCHOR" : "SERVICE OFF";
                 }
 
                 float desiredEnergy = clamp(Math.abs(LauncherScrollBus.velocityPagesPerSec) * 0.34f, 0f, 1f);
@@ -520,7 +496,7 @@ public class ProbeWallpaperService extends WallpaperService {
                 GLES20.glUniform2f(uScreen, w, h);
 
                 for (LauncherScrollBus.IconBox box : boxes) {
-                    float cx = box.movesWithPages ? box.worldCenterX - pos * w : box.worldCenterX;
+                    float cx = box.movesWithPages ? box.localCenterX + (box.pageIndex - pos) * w : box.localCenterX;
                     float cy = box.centerY;
                     float bw = Math.max(22f, box.width + 8f);
                     float bh = Math.max(22f, box.height + 8f);
@@ -578,7 +554,7 @@ public class ProbeWallpaperService extends WallpaperService {
                 debugPaint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
                 debugPaint.setTextSize(54f);
                 debugPaint.setColor(Color.WHITE);
-                debugCanvas.drawText("Dual Bounds Engine v0.20", 38, 68, debugPaint);
+                debugCanvas.drawText("Settled Cache Engine v0.21", 38, 68, debugPaint);
                 debugPaint.setTypeface(android.graphics.Typeface.DEFAULT);
                 debugPaint.setTextSize(31f);
 
@@ -598,9 +574,9 @@ public class ProbeWallpaperService extends WallpaperService {
                     l5 = String.format(Locale.US, "LB %s | RT %s",
                             trim(LauncherScrollBus.anchorLeftBottomLabel, 22),
                             trim(LauncherScrollBus.anchorRightTopLabel, 22));
-                    l6 = String.format(Locale.US, "icons %d scans %d reacq %d changes %d",
-                            LauncherScrollBus.iconSnapshot.length, LauncherScrollBus.layoutScans,
-                            LauncherScrollBus.anchorReacquires, LauncherScrollBus.boundsChanges);
+                    l6 = String.format(Locale.US, "icons %d pages %d scans %d reacq %d",
+                            LauncherScrollBus.iconSnapshot.length, LauncherScrollBus.cachedPageCount,
+                            LauncherScrollBus.layoutScans, LauncherScrollBus.anchorReacquires);
                     l7 = trim(String.format(Locale.US, "STATE %s  touchV=%.0f  age=%dms",
                             LauncherScrollBus.trackerState, LauncherScrollBus.touchVelocityX, age), 78);
                 }

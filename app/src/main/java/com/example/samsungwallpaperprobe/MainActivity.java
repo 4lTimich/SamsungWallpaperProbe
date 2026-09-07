@@ -76,13 +76,13 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView title = text("Iridescent Dual Bounds Engine v0.20", 25f, Color.BLACK, true);
+        TextView title = text("Iridescent Settled Cache Engine v0.21", 25f, Color.BLACK, true);
         title.setGravity(Gravity.CENTER);
         root.addView(title, matchWrap());
 
         TextView body = text(
-                "v0.20 отслеживает сразу две реальные иконки One UI: левую нижнюю и правую верхнюю. При движении берётся тот реальный bounds, который меньше запаздывает в текущем направлении, а кэш остальных иконок по-прежнему обновляется редко. " +
-                "Сетка оставлена для старого стекла, но bounds-трекер от неё больше не зависит. Высокочастотные touch-события используются только как интерполяция между редкими реальными bounds — они не решают, какая страница выбрана.",
+                "v0.21 — новая модель координат. Раскладка приложения сохраняется ТОЛЬКО когда страница полностью остановилась. Во время свайпа кэш не изменяется вообще. " +
+                "Любая уже известная иконка вычисляет один абсолютный offset через свой номер страницы, координату X в покое и текущий boundsInScreen. Сетка оставлена только как запасной ручной инструмент; touch в этой версии вообще не участвует в offset.",
                 16f, Color.DKGRAY, false);
         body.setGravity(Gravity.CENTER);
         body.setPadding(0, dp(14), 0, dp(18));
@@ -144,7 +144,7 @@ public class MainActivity extends Activity {
         root.addView(wallpaper, matchWrap());
 
         TextView note = text(
-                "Белая обводка всех найденных приложений работает независимо от режима отладки и независимо от сетки. Полный accessibility-tree сканируется при выходе на Home и при редкой смене anchor. В движении опрашивается только одна иконка. В отладке теперь отдельно видно POLL Hz и CHANGE Hz: если POLL ≈120, а CHANGE ≈20, значит ступенчатость идёт от частоты обновления bounds Samsung, а не от GPU.",
+                "Белые обводки теперь строятся из неизменяемых снимков каждой страницы: local X/Y + page index. Новый снимок страницы создаётся только после остановки. При переходе между уже изученными страницами tracker может менять anchor, не меняя систему координат и не перенося старые иконки на новую страницу.",
                 13.5f, Color.DKGRAY, false);
         note.setGravity(Gravity.CENTER);
         note.setPadding(0, dp(18), 0, 0);

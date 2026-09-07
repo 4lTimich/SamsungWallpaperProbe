@@ -14,22 +14,19 @@ import java.util.ArrayList;
 import java.util.Locale;
 
 /**
- * v0.20 dual real-bounds tracker.
+ * v0.21 — immutable settled-page cache.
  *
- * We keep two real One UI icon nodes alive at once: the left/bottom icon and the right/top icon.
- * For a swipe toward the next page, the right/top icon stays on screen longer; for a swipe toward
- * the previous page, the left/bottom icon stays on screen longer.  If one node publishes a newer
- * bound than the other, the tracker takes the leading real position in the current direction
- * instead of averaging in a stale sample.  This reduces phase lag without inventing launcher
- * physics.
+ * No layout snapshot is ever modified during a swipe. Each cached moving icon stores:
+ *   pageIndex + resting local X/Y.
+ * A live AccessibilityNodeInfo only supplies current X. Therefore every known icon lives in the
+ * same absolute coordinate system and anchors can be handed off without rebasing.
  */
 public class LauncherAccessibilityService extends AccessibilityService {
     private static final String LAUNCHER = "com.sec.android.app.launcher";
     private static final long POLL_MS = 8L;
     private static final long IDLE_MS = 120L;
-    private static final long MIN_RESCAN_MS = 55L;
-    private static final long MIN_PREFETCH_SCAN_MS = 48L;
-    private static final long HANDOFF_RESCAN_MS = 64L;
+    private static final long SETTLE_MS = 135L;
+    private static final long REACQUIRE_MIN_MS = 58L;
     private static final int MAX_TREE_NODES = 1800;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -37,25 +34,22 @@ public class LauncherAccessibilityService extends AccessibilityService {
     private boolean running = false;
     private long seenHomeEpoch = -1L;
     private long seenRescanGeneration = -1L;
-    private long lastFullScanMs = 0L;
+    private long lastAcquireScanMs = 0L;
+    private long lastPositionChangeMs = 0L;
+    private int lastSettledPage = -1;
 
     private final AnchorTrack leftBottom = new AnchorTrack("LEFT-BOTTOM");
     private final AnchorTrack rightTop = new AnchorTrack("RIGHT-TOP");
-    private float lastUnifiedPosition = Float.NaN;
-    private long lastUnifiedMoveMs = 0L;
 
+    private float lastUnifiedPosition = Float.NaN;
     private long pollWindowStart = 0L;
     private int pollWindowCount = 0;
     private long changeWindowStart = 0L;
     private int changeWindowCount = 0;
 
-    private int prefetchPairKey = Integer.MIN_VALUE;
-    private int prefetchStage = -1;
-
     private final Runnable tracker = new Runnable() {
         @Override public void run() {
             if (!running) return;
-
             if (!LauncherScrollBus.wallpaperVisible) {
                 handler.postDelayed(this, IDLE_MS);
                 return;
@@ -63,19 +57,23 @@ public class LauncherAccessibilityService extends AccessibilityService {
 
             long now = SystemClock.uptimeMillis();
             boolean homeEntry = seenHomeEpoch != LauncherScrollBus.homeEpoch;
-            boolean rescan = seenRescanGeneration != LauncherScrollBus.rescanGeneration;
-
-            if (homeEntry || rescan) {
+            boolean manualRescan = seenRescanGeneration != LauncherScrollBus.rescanGeneration;
+            if (homeEntry) {
                 seenHomeEpoch = LauncherScrollBus.homeEpoch;
+                // First scan is legal because opening Home starts at a settled launcher page.
+                captureSettledPageAndAcquire(now, resolveInitialPage());
+            } else if (manualRescan) {
                 seenRescanGeneration = LauncherScrollBus.rescanGeneration;
-                fullScanAndAcquire(now);
+                int p = settledPageCandidate(now);
+                if (p >= 0) captureSettledPageAndAcquire(now, p);
             } else {
-                boolean sampled = sampleAnchors(now);
-                if (sampled) {
-                    maybePrefetchLayout(now);
-                } else if (now - lastFullScanMs >= MIN_RESCAN_MS) {
-                    fullScanAndAcquire(now);
+                boolean ok = sampleAnchors(now);
+                if (!ok && now - lastAcquireScanMs >= REACQUIRE_MIN_MS) {
+                    // Search visible nodes only to attach them to ALREADY CACHED icons.
+                    // This scan never changes layout ownership/coordinates.
+                    reacquireKnownAnchors(now);
                 }
+                maybeCaptureAfterSettle(now);
             }
 
             handler.postDelayed(this, POLL_MS);
@@ -88,7 +86,7 @@ public class LauncherAccessibilityService extends AccessibilityService {
         prefs = getSharedPreferences(Prefs.PREFS, MODE_PRIVATE);
         running = true;
         LauncherScrollBus.serviceConnected = true;
-        LauncherScrollBus.trackerState = "DUAL BOUNDS READY";
+        LauncherScrollBus.trackerState = "SETTLED CACHE READY";
         LauncherScrollBus.requestRescan();
         handler.removeCallbacks(tracker);
         handler.post(tracker);
@@ -100,25 +98,21 @@ public class LauncherAccessibilityService extends AccessibilityService {
         CharSequence pkg = event.getPackageName();
         if (pkg == null || !LAUNCHER.contentEquals(pkg)) return;
         LauncherScrollBus.homeActive = true;
-        if (LauncherScrollBus.wallpaperVisible) {
-            // Accessibility events are free wake-ups: sample both cached nodes immediately.
-            sampleAnchors(SystemClock.uptimeMillis());
+        if (LauncherScrollBus.wallpaperVisible) sampleAnchors(SystemClock.uptimeMillis());
+    }
+
+    private int resolveInitialPage() {
+        int pages = pages();
+        int saved = clampInt(prefs.getInt(Prefs.KEY_SAVED_PAGE, 0), 0, pages - 1);
+        if (LauncherScrollBus.authoritativePage >= 0) {
+            return clampInt(LauncherScrollBus.authoritativePage, 0, pages - 1);
         }
+        return saved;
     }
 
     private boolean sampleAnchors(long now) {
-        int direction = directionHint();
-
-        // Sample the anchor that should survive this direction first, shaving a little IPC latency
-        // from the coordinate that is most likely to become authoritative for this frame.
-        AnchorSample lb, rt;
-        if (direction > 0) {
-            rt = sampleOne(rightTop, now);
-            lb = sampleOne(leftBottom, now);
-        } else {
-            lb = sampleOne(leftBottom, now);
-            rt = sampleOne(rightTop, now);
-        }
+        AnchorSample lb = sampleOne(leftBottom, now);
+        AnchorSample rt = sampleOne(rightTop, now);
 
         if (!lb.valid && !rt.valid) {
             LauncherScrollBus.anchorLeftBottomValid = false;
@@ -133,53 +127,45 @@ public class LauncherAccessibilityService extends AccessibilityService {
         if (lb.valid && rt.valid) {
             LauncherScrollBus.anchorDisagreementPx = Math.abs(lb.position - rt.position) * w;
 
-            if (direction > 0) {
-                // Icons move left / page position grows. The larger real position is the fresher
-                // sample when one node is one Samsung accessibility tick behind the other.
-                if (rt.position >= lb.position) { pos = rt.position; active = rightTop; }
-                else { pos = lb.position; active = leftBottom; }
-            } else if (direction < 0) {
-                // Icons move right / page position shrinks. Take the smaller real position.
-                if (lb.position <= rt.position) { pos = lb.position; active = leftBottom; }
-                else { pos = rt.position; active = rightTop; }
-            } else if (lb.changed != rt.changed) {
-                if (lb.changed) { pos = lb.position; active = leftBottom; }
-                else { pos = rt.position; active = rightTop; }
-            } else if (Math.abs(lb.position - rt.position) <= 0.012f) {
-                // At rest both should agree. Averaging only very close samples suppresses integer
-                // pixel quantisation without adding visible phase lag.
+            // Both formulas should be identical. Prefer whichever actually changed most recently.
+            // Average only when the two measurements already agree within ~2 px.
+            if (Math.abs(lb.position - rt.position) * w <= 2.2f) {
                 pos = (lb.position + rt.position) * 0.5f;
                 active = lb.changedMs >= rt.changedMs ? leftBottom : rightTop;
-            } else if (lb.changedMs >= rt.changedMs) {
-                pos = lb.position; active = leftBottom;
+            } else if (lb.changedMs > rt.changedMs) {
+                pos = lb.position;
+                active = leftBottom;
+            } else if (rt.changedMs > lb.changedMs) {
+                pos = rt.position;
+                active = rightTop;
             } else {
-                pos = rt.position; active = rightTop;
+                // Same timestamp but different quantised bounds: choose the value closer to the
+                // previous continuous position, avoiding directional heuristics.
+                float prev = Float.isNaN(lastUnifiedPosition) ? lb.position : lastUnifiedPosition;
+                if (Math.abs(lb.position - prev) <= Math.abs(rt.position - prev)) {
+                    pos = lb.position; active = leftBottom;
+                } else {
+                    pos = rt.position; active = rightTop;
+                }
             }
         } else if (lb.valid) {
-            pos = lb.position;
-            active = leftBottom;
+            pos = lb.position; active = leftBottom;
             LauncherScrollBus.anchorDisagreementPx = 0f;
         } else {
-            pos = rt.position;
-            active = rightTop;
+            pos = rt.position; active = rightTop;
             LauncherScrollBus.anchorDisagreementPx = 0f;
         }
 
-        boolean unifiedChanged = Float.isNaN(lastUnifiedPosition)
-                || Math.abs(pos - lastUnifiedPosition) > 0.00012f;
-        if (unifiedChanged) {
-            LauncherScrollBus.boundsChanges++;
-            lastUnifiedMoveMs = now;
-
+        boolean changed = Float.isNaN(lastUnifiedPosition) || Math.abs(pos - lastUnifiedPosition) > 0.00012f;
+        if (changed) {
             LauncherScrollBus.previousChangedPosition = LauncherScrollBus.lastChangedPosition;
             LauncherScrollBus.previousChangedUptimeMs = LauncherScrollBus.lastChangedUptimeMs;
             LauncherScrollBus.lastChangedPosition = pos;
             LauncherScrollBus.lastChangedUptimeMs = now;
-            LauncherScrollBus.touchXAtLastBoundsChange = LauncherScrollBus.touchX;
-            LauncherScrollBus.touchWasActiveAtLastBoundsChange = LauncherScrollBus.touchActive;
+            LauncherScrollBus.boundsChanges++;
+            lastPositionChangeMs = now;
 
-            if (LauncherScrollBus.previousChangedUptimeMs > 0L
-                    && now > LauncherScrollBus.previousChangedUptimeMs) {
+            if (LauncherScrollBus.previousChangedUptimeMs > 0L && now > LauncherScrollBus.previousChangedUptimeMs) {
                 LauncherScrollBus.velocityPagesPerSec =
                         (LauncherScrollBus.lastChangedPosition - LauncherScrollBus.previousChangedPosition)
                                 * 1000f / (now - LauncherScrollBus.previousChangedUptimeMs);
@@ -193,7 +179,7 @@ public class LauncherAccessibilityService extends AccessibilityService {
                 changeWindowCount = 0;
                 changeWindowStart = now;
             }
-        } else if (now - lastUnifiedMoveMs > 90L) {
+        } else if (now - lastPositionChangeMs > 95L) {
             LauncherScrollBus.velocityPagesPerSec = 0f;
         }
         lastUnifiedPosition = pos;
@@ -204,251 +190,293 @@ public class LauncherAccessibilityService extends AccessibilityService {
         LauncherScrollBus.positionSequence++;
         LauncherScrollBus.boundsSamples++;
         LauncherScrollBus.activeAnchorRole = active.role;
-        publishUnifiedAnchorMetadata(active);
-        LauncherScrollBus.trackerState = unifiedChanged ? "DUAL BOUNDS CHANGED" : "DUAL BOUNDS POLL";
+        publishUnifiedAnchor(active);
+        LauncherScrollBus.trackerState = changed ? "REAL BOUNDS CHANGED" : "REAL BOUNDS POLL";
 
         pollWindowCount++;
         if (pollWindowStart == 0L) pollWindowStart = now;
-        long pollElapsed = now - pollWindowStart;
-        if (pollElapsed >= 1000L) {
-            LauncherScrollBus.trackerPollHz = pollWindowCount * 1000f / pollElapsed;
+        long pe = now - pollWindowStart;
+        if (pe >= 1000L) {
+            LauncherScrollBus.trackerPollHz = pollWindowCount * 1000f / pe;
             pollWindowCount = 0;
             pollWindowStart = now;
         }
 
-        int pages = clampInt(prefs.getInt(Prefs.KEY_PAGE_COUNT, 4), 2, 9);
-        int rounded = clampInt(Math.round(pos), 0, pages - 1);
-        if (now - lastUnifiedMoveMs > 110L && Math.abs(pos - rounded) < 0.035f) {
-            publishPage(rounded, now);
-        }
-
-        // Directional handoff: reacquire while the source-page anchor is still visible, not after
-        // it disappears. Right/top survives longest going to next page; left/bottom survives
-        // longest going to previous page.
-        if (now - lastFullScanMs >= HANDOFF_RESCAN_MS) {
-            if (direction > 0 && rt.valid && rt.rect.centerX() < w * 0.28f) {
-                fullScanAndAcquire(now);
-            } else if (direction < 0 && lb.valid && lb.rect.centerX() > w * 0.72f) {
-                fullScanAndAcquire(now);
-            } else if (!lb.valid || !rt.valid) {
-                fullScanAndAcquire(now);
-            }
-        }
-
+        // Reacquire BEFORE both source nodes disappear, but only against immutable known snapshots.
+        boolean edge = false;
+        if (lb.valid && (lb.rect.right < w * 0.16f || lb.rect.left > w * 0.84f)) edge = true;
+        if (rt.valid && (rt.rect.right < w * 0.16f || rt.rect.left > w * 0.84f)) edge = true;
+        if (edge && now - lastAcquireScanMs >= REACQUIRE_MIN_MS) reacquireKnownAnchors(now);
         return true;
     }
 
-    private AnchorSample sampleOne(AnchorTrack track, long now) {
-        if (track.node == null) {
-            track.valid = false;
-            publishTrackDiagnostics(track);
-            return AnchorSample.invalid(track);
+    private AnchorSample sampleOne(AnchorTrack t, long now) {
+        if (t.node == null || t.pageIndex < 0) {
+            t.invalidate();
+            publishTrack(t);
+            return AnchorSample.invalid();
         }
-
         try {
-            if (!track.node.refresh()) {
-                track.invalidate();
-                publishTrackDiagnostics(track);
-                return AnchorSample.invalid(track);
+            if (!t.node.refresh()) {
+                t.invalidate();
+                publishTrack(t);
+                return AnchorSample.invalid();
             }
-        } catch (Throwable t) {
-            track.invalidate();
-            publishTrackDiagnostics(track);
-            return AnchorSample.invalid(track);
+        } catch (Throwable e) {
+            t.invalidate();
+            publishTrack(t);
+            return AnchorSample.invalid();
         }
 
         Rect r = new Rect();
-        track.node.getBoundsInScreen(r);
+        t.node.getBoundsInScreen(r);
         if (r.width() <= 0 || r.height() <= 0) {
-            track.invalidate();
-            publishTrackDiagnostics(track);
-            return AnchorSample.invalid(track);
+            t.invalidate();
+            publishTrack(t);
+            return AnchorSample.invalid();
         }
 
         int w = Math.max(1, getResources().getDisplayMetrics().widthPixels);
         int cx = r.centerX();
-        int cy = r.centerY();
-        float pos = (track.worldX - cx) / w;
-        boolean changed = cx != track.lastX || cy != track.lastY;
-
+        float pos = t.pageIndex + (t.restCenterX - cx) / w;
+        boolean changed = cx != t.lastX || r.centerY() != t.lastY;
         if (changed) {
-            track.changedMs = now;
-            track.changes++;
+            t.changedMs = now;
+            t.changes++;
         }
-        track.lastX = cx;
-        track.lastY = cy;
-        track.position = pos;
-        track.rect.set(r);
-        track.valid = true;
-        publishTrackDiagnostics(track);
-        return new AnchorSample(track, true, changed, pos, track.changedMs, new Rect(r));
+        t.lastX = cx;
+        t.lastY = r.centerY();
+        t.position = pos;
+        t.rect.set(r);
+        t.valid = true;
+        publishTrack(t);
+        return new AnchorSample(true, changed, pos, t.changedMs, new Rect(r));
     }
 
-    private int directionHint() {
-        if (LauncherScrollBus.touchActive && Math.abs(LauncherScrollBus.touchVelocityX) > 24f) {
-            // Finger left => icons left => page position increases.
-            return LauncherScrollBus.touchVelocityX < 0f ? 1 : -1;
-        }
-        if (Math.abs(LauncherScrollBus.velocityPagesPerSec) > 0.012f) {
-            return LauncherScrollBus.velocityPagesPerSec > 0f ? 1 : -1;
-        }
-        return 0;
-    }
-
-    private void publishTrackDiagnostics(AnchorTrack t) {
-        if ("LEFT-BOTTOM".equals(t.role)) {
-            LauncherScrollBus.anchorLeftBottomValid = t.valid;
-            LauncherScrollBus.anchorLeftBottomLabel = t.label;
-            LauncherScrollBus.anchorLeftBottomX = t.lastX == Integer.MIN_VALUE ? 0 : t.lastX;
-            LauncherScrollBus.anchorLeftBottomY = t.lastY == Integer.MIN_VALUE ? 0 : t.lastY;
-            LauncherScrollBus.anchorLeftBottomPosition = t.position;
-            LauncherScrollBus.anchorLeftBottomChangedMs = t.changedMs;
-        } else {
-            LauncherScrollBus.anchorRightTopValid = t.valid;
-            LauncherScrollBus.anchorRightTopLabel = t.label;
-            LauncherScrollBus.anchorRightTopX = t.lastX == Integer.MIN_VALUE ? 0 : t.lastX;
-            LauncherScrollBus.anchorRightTopY = t.lastY == Integer.MIN_VALUE ? 0 : t.lastY;
-            LauncherScrollBus.anchorRightTopPosition = t.position;
-            LauncherScrollBus.anchorRightTopChangedMs = t.changedMs;
-        }
-    }
-
-    private void publishUnifiedAnchorMetadata(AnchorTrack active) {
-        LauncherScrollBus.anchorLabel = active.label;
-        LauncherScrollBus.anchorLeft = active.rect.left;
-        LauncherScrollBus.anchorTop = active.rect.top;
-        LauncherScrollBus.anchorRight = active.rect.right;
-        LauncherScrollBus.anchorBottom = active.rect.bottom;
-        LauncherScrollBus.anchorCenterX = active.rect.centerX();
-        LauncherScrollBus.anchorCenterY = active.rect.centerY();
-        LauncherScrollBus.anchorWorldX = active.worldX;
-    }
-
-    private void fullScanAndAcquire(long now) {
-        lastFullScanMs = now;
-        LauncherScrollBus.layoutScans++;
-        LauncherScrollBus.lastLayoutScanMs = now;
-
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null) {
-            LauncherScrollBus.homeActive = false;
-            clearAnchors("HOME ROOT MISSING");
-            return;
-        }
-        CharSequence pkg = root.getPackageName();
-        if (pkg == null || !LAUNCHER.contentEquals(pkg)) {
-            LauncherScrollBus.homeActive = false;
-            clearAnchors("HOME NOT ACTIVE");
-            return;
-        }
-        LauncherScrollBus.homeActive = true;
+    /**
+     * Search the live tree for nodes that correspond to ALREADY CACHED icons. No cache mutation.
+     * Each match can independently estimate absolute position. We choose matches near our current
+     * position and then pick left-bottom / right-top among those, enabling page-to-page handoff.
+     */
+    private void reacquireKnownAnchors(long now) {
+        lastAcquireScanMs = now;
+        AccessibilityNodeInfo root = launcherRoot();
+        if (root == null) return;
 
         int w = Math.max(1, getResources().getDisplayMetrics().widthPixels);
         int h = Math.max(1, getResources().getDisplayMetrics().heightPixels);
-        ArrayList<Candidate> icons = collectIconCandidates(root, w, h);
-        if (icons.isEmpty()) {
-            clearAnchors("NO ICON NODES");
-            return;
-        }
+        ArrayList<Candidate> visible = collectIconCandidates(root, w, h);
+        LauncherScrollBus.IconBox[] cache = LauncherScrollBus.iconSnapshot;
+        if (visible.isEmpty() || cache.length == 0) return;
 
-        float basisPos;
-        if (LauncherScrollBus.positionValid) {
-            basisPos = LauncherScrollBus.position;
-        } else if (LauncherScrollBus.authoritativePage >= 0) {
-            basisPos = LauncherScrollBus.authoritativePage;
-        } else {
-            basisPos = clampInt(prefs.getInt(Prefs.KEY_SAVED_PAGE, 0), 0,
-                    Math.max(0, prefs.getInt(Prefs.KEY_PAGE_COUNT, 4) - 1));
-        }
+        float reference = LauncherScrollBus.positionValid ? LauncherScrollBus.position
+                : (LauncherScrollBus.authoritativePage >= 0 ? LauncherScrollBus.authoritativePage : resolveInitialPage());
 
-        publishIconSnapshot(icons, basisPos, w);
-
-        Candidate lb = chooseLeftBottom(icons, w, h);
-        Candidate rt = chooseRightTop(icons, w, h, lb);
-        if (lb == null && rt == null) {
-            clearAnchors("NO MOVING ICON");
-            return;
+        ArrayList<KnownMatch> matches = new ArrayList<>();
+        for (Candidate c : visible) {
+            if (c.rect.centerY() > h * 0.84f) continue; // dock cannot define page offset
+            String nl = normalize(c.label);
+            for (LauncherScrollBus.IconBox b : cache) {
+                if (!b.movesWithPages || b.pageIndex < 0) continue;
+                if (!normalize(b.label).equals(nl)) continue;
+                if (Math.abs(b.centerY - c.rect.centerY()) > Math.max(72f, b.height * 0.65f)) continue;
+                float p = b.pageIndex + (b.localCenterX - c.rect.centerX()) / w;
+                if (Math.abs(p - reference) > 0.72f) continue;
+                matches.add(new KnownMatch(c, b, p));
+            }
         }
-        acquirePair(lb, rt, basisPos, now, w);
+        if (matches.isEmpty()) return;
+
+        KnownMatch lb = chooseLeftBottomMatch(matches, h);
+        KnownMatch rt = chooseRightTopMatch(matches, h, lb);
+        if (lb == null && rt == null) return;
+
+        assignMatch(leftBottom, lb, now);
+        assignMatch(rightTop, rt != null ? rt : lb, now);
+        LauncherScrollBus.anchorReacquires++;
+        LauncherScrollBus.trackerState = "KNOWN ANCHOR HANDOFF";
+        lastUnifiedPosition = Float.NaN;
+        sampleAnchors(now);
     }
 
-    /** Sparse incoming-page cache refresh. No anchor replacement here unless the directional
-     * handoff condition in sampleAnchors() explicitly requests a full scan. */
-    private void maybePrefetchLayout(long now) {
-        if (!LauncherScrollBus.positionValid) return;
+    private KnownMatch chooseLeftBottomMatch(ArrayList<KnownMatch> ms, int h) {
+        KnownMatch best = null;
+        for (KnownMatch m : ms) {
+            if (best == null || m.c.rect.centerY() > best.c.rect.centerY()
+                    || (m.c.rect.centerY() == best.c.rect.centerY()
+                    && m.c.rect.centerX() < best.c.rect.centerX())) best = m;
+        }
+        return best;
+    }
 
-        int pages = clampInt(prefs.getInt(Prefs.KEY_PAGE_COUNT, 4), 2, 9);
+    private KnownMatch chooseRightTopMatch(ArrayList<KnownMatch> ms, int h, KnownMatch avoid) {
+        KnownMatch best = null;
+        for (KnownMatch m : ms) {
+            if (m == avoid && ms.size() > 1) continue;
+            if (best == null || m.c.rect.centerY() < best.c.rect.centerY()
+                    || (m.c.rect.centerY() == best.c.rect.centerY()
+                    && m.c.rect.centerX() > best.c.rect.centerX())) best = m;
+        }
+        return best == null ? avoid : best;
+    }
+
+    private void assignMatch(AnchorTrack t, KnownMatch m, long now) {
+        if (m == null) { t.clear(); return; }
+        t.node = m.c.node;
+        t.label = m.b.label;
+        t.pageIndex = m.b.pageIndex;
+        t.restCenterX = m.b.localCenterX;
+        t.restCenterY = m.b.centerY;
+        t.lastX = Integer.MIN_VALUE;
+        t.lastY = Integer.MIN_VALUE;
+        t.changedMs = now;
+        t.position = m.position;
+        t.rect.set(m.c.rect);
+        t.valid = true;
+        publishTrack(t);
+    }
+
+    private void maybeCaptureAfterSettle(long now) {
+        int p = settledPageCandidate(now);
+        if (p < 0) return;
+        if (p == lastSettledPage && now - LauncherScrollBus.lastLayoutScanMs < 700L) return;
+        captureSettledPageAndAcquire(now, p);
+    }
+
+    private int settledPageCandidate(long now) {
+        if (!LauncherScrollBus.positionValid) return -1;
         float pos = LauncherScrollBus.position;
-        int base = LauncherScrollBus.authoritativePage >= 0
-                ? clampInt(LauncherScrollBus.authoritativePage, 0, pages - 1)
-                : clampInt(Math.round(pos), 0, pages - 1);
-
-        float delta = pos - base;
-        float travel = Math.abs(delta);
-        if (travel < 0.045f) {
-            prefetchPairKey = Integer.MIN_VALUE;
-            prefetchStage = -1;
-            return;
-        }
-
-        int direction = delta > 0f ? 1 : -1;
-        int target = base + direction;
-        if (target < 0 || target >= pages) return;
-
-        int pairKey = base * 32 + target;
-        if (pairKey != prefetchPairKey) {
-            prefetchPairKey = pairKey;
-            prefetchStage = -1;
-        }
-
-        int stage = travel >= 0.40f ? 2 : (travel >= 0.20f ? 1 : (travel >= 0.075f ? 0 : -1));
-        if (stage <= prefetchStage) return;
-        if (now - lastFullScanMs < MIN_PREFETCH_SCAN_MS) return;
-
-        prefetchStage = stage;
-        scanLayoutOnly(now);
+        int p = Math.round(pos);
+        if (p < 0 || p >= pages()) return -1;
+        if (Math.abs(pos - p) > 0.025f) return -1;
+        if (now - lastPositionChangeMs < SETTLE_MS) return -1;
+        return p;
     }
 
-    private void scanLayoutOnly(long now) {
-        lastFullScanMs = now;
-        LauncherScrollBus.layoutScans++;
-        LauncherScrollBus.lastLayoutScanMs = now;
-
-        AccessibilityNodeInfo root = getRootInActiveWindow();
+    /** Capture is the ONLY function allowed to mutate the page-local layout cache. */
+    private void captureSettledPageAndAcquire(long now, int page) {
+        AccessibilityNodeInfo root = launcherRoot();
         if (root == null) return;
-        CharSequence pkg = root.getPackageName();
-        if (pkg == null || !LAUNCHER.contentEquals(pkg)) return;
-
         int w = Math.max(1, getResources().getDisplayMetrics().widthPixels);
         int h = Math.max(1, getResources().getDisplayMetrics().heightPixels);
         ArrayList<Candidate> icons = collectIconCandidates(root, w, h);
         if (icons.isEmpty()) return;
 
-        float basisPos = LauncherScrollBus.positionValid
-                ? LauncherScrollBus.position
-                : (LauncherScrollBus.authoritativePage >= 0
-                    ? LauncherScrollBus.authoritativePage
-                    : clampInt(prefs.getInt(Prefs.KEY_SAVED_PAGE, 0), 0,
-                        Math.max(0, prefs.getInt(Prefs.KEY_PAGE_COUNT, 4) - 1)));
-        publishIconSnapshot(icons, basisPos, w);
+        publishSettledSnapshot(icons, page, w, h);
+        lastSettledPage = page;
+        publishPage(page, now);
+
+        Candidate lb = chooseLeftBottom(icons, w, h);
+        Candidate rt = chooseRightTop(icons, w, h, lb);
+        if (lb != null) assignFresh(leftBottom, lb, page, now);
+        else leftBottom.clear();
+        if (rt != null) assignFresh(rightTop, rt, page, now);
+        else if (lb != null) assignFresh(rightTop, lb, page, now);
+        else rightTop.clear();
+
+        LauncherScrollBus.anchorReacquires++;
+        LauncherScrollBus.trackerState = "SETTLED PAGE " + (page + 1) + " CAPTURED";
+        lastUnifiedPosition = Float.NaN;
+        sampleAnchors(now);
     }
+
+    private void assignFresh(AnchorTrack t, Candidate c, int page, long now) {
+        t.node = c.node;
+        t.label = c.label;
+        t.pageIndex = page;
+        t.restCenterX = c.rect.centerX();
+        t.restCenterY = c.rect.centerY();
+        t.lastX = Integer.MIN_VALUE;
+        t.lastY = Integer.MIN_VALUE;
+        t.changedMs = now;
+        t.position = page;
+        t.rect.set(c.rect);
+        t.valid = true;
+        publishTrack(t);
+    }
+
+    private void publishSettledSnapshot(ArrayList<Candidate> icons, int page, int w, int h) {
+        LauncherScrollBus.layoutScans++;
+        LauncherScrollBus.lastLayoutScanMs = SystemClock.uptimeMillis();
+
+        ArrayList<LauncherScrollBus.IconBox> merged = new ArrayList<>();
+        for (LauncherScrollBus.IconBox b : LauncherScrollBus.iconSnapshot) {
+            // Replace this moving page atomically. Dock is also refreshed by the current settled scan.
+            if (b.movesWithPages && b.pageIndex == page) continue;
+            if (!b.movesWithPages) continue;
+            merged.add(b);
+        }
+
+        ArrayList<LauncherScrollBus.IconBox> freshPage = new ArrayList<>();
+        ArrayList<LauncherScrollBus.IconBox> freshDock = new ArrayList<>();
+        for (Candidate c : icons) {
+            boolean moves = c.rect.centerY() <= h * 0.84f;
+            LauncherScrollBus.IconBox b = new LauncherScrollBus.IconBox(
+                    c.rect.centerX(), c.rect.centerY(), c.rect.width(), c.rect.height(),
+                    c.label, moves, moves ? page : -1);
+            addOrReplace(moves ? freshPage : freshDock, b);
+        }
+        for (LauncherScrollBus.IconBox b : freshPage) merged.add(b);
+        for (LauncherScrollBus.IconBox b : freshDock) merged.add(b);
+
+        LauncherScrollBus.iconSnapshot = merged.toArray(new LauncherScrollBus.IconBox[0]);
+        LauncherScrollBus.iconSnapshotVersion++;
+
+        boolean[] seen = new boolean[pages()];
+        for (LauncherScrollBus.IconBox b : LauncherScrollBus.iconSnapshot) {
+            if (b.movesWithPages && b.pageIndex >= 0 && b.pageIndex < seen.length) seen[b.pageIndex] = true;
+        }
+        int count = 0;
+        for (boolean v : seen) if (v) count++;
+        LauncherScrollBus.cachedPageCount = count;
+    }
+
+    private void addOrReplace(ArrayList<LauncherScrollBus.IconBox> list, LauncherScrollBus.IconBox n) {
+        String nl = normalize(n.label);
+        for (int i = 0; i < list.size(); i++) {
+            LauncherScrollBus.IconBox o = list.get(i);
+            boolean sameLabel = normalize(o.label).equals(nl);
+            float dx = Math.abs(o.localCenterX - n.localCenterX);
+            float dy = Math.abs(o.centerY - n.centerY);
+            boolean sameSlot = dx < Math.max(28f, Math.min(o.width, n.width) * 0.38f)
+                    && dy < Math.max(28f, Math.min(o.height, n.height) * 0.32f);
+            if (sameLabel || sameSlot) {
+                float oa = Math.max(1f, o.width * o.height);
+                float na = Math.max(1f, n.width * n.height);
+                if (na <= oa * 1.08f) list.set(i, n);
+                return;
+            }
+        }
+        list.add(n);
+    }
+
+    private AccessibilityNodeInfo launcherRoot() {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) {
+            LauncherScrollBus.homeActive = false;
+            return null;
+        }
+        CharSequence pkg = root.getPackageName();
+        if (pkg == null || !LAUNCHER.contentEquals(pkg)) {
+            LauncherScrollBus.homeActive = false;
+            return null;
+        }
+        LauncherScrollBus.homeActive = true;
+        return root;
+    }
+
     private ArrayList<Candidate> collectIconCandidates(AccessibilityNodeInfo root, int w, int h) {
         ArrayList<Candidate> raw = new ArrayList<>();
         ArrayDeque<AccessibilityNodeInfo> q = new ArrayDeque<>();
         q.add(root);
         int seen = 0;
-
         while (!q.isEmpty() && seen < MAX_TREE_NODES) {
             AccessibilityNodeInfo n = q.removeFirst();
             seen++;
-
             Rect r = new Rect();
             n.getBoundsInScreen(r);
             String label = nodeLabel(n);
-            if (looksLikeIconNode(n, r, label, w, h)) {
-                raw.add(new Candidate(n, r, label));
-            }
-
+            if (looksLikeIconNode(n, r, label, w, h)) raw.add(new Candidate(n, r, label));
             int cc = n.getChildCount();
             for (int i = 0; i < cc && seen + q.size() < MAX_TREE_NODES; i++) {
                 AccessibilityNodeInfo child = n.getChild(i);
@@ -456,242 +484,89 @@ public class LauncherAccessibilityService extends AccessibilityService {
             }
         }
 
-        // Nested launcher nodes often repeat the same icon. Keep one candidate per strongly
-        // overlapping rectangle/label, preferring the smaller, clickable node.
         ArrayList<Candidate> out = new ArrayList<>();
         for (Candidate c : raw) {
-            int replace = -1;
+            int hit = -1;
             for (int i = 0; i < out.size(); i++) {
-                Candidate old = out.get(i);
-                float overlap = overlapRatio(old.rect, c.rect);
-                boolean sameLabel = normalize(old.label).equals(normalize(c.label));
-                boolean sameGeometry = Math.abs(old.rect.centerX() - c.rect.centerX()) <= 6
-                        && Math.abs(old.rect.centerY() - c.rect.centerY()) <= 6
-                        && overlap > 0.84f;
-                if ((sameLabel && overlap > 0.72f) || sameGeometry) {
-                    replace = i;
-                    break;
-                }
+                Candidate o = out.get(i);
+                float overlap = overlapRatio(o.rect, c.rect);
+                boolean sameLabel = normalize(o.label).equals(normalize(c.label));
+                boolean sameGeometry = Math.abs(o.rect.centerX() - c.rect.centerX()) <= 6
+                        && Math.abs(o.rect.centerY() - c.rect.centerY()) <= 6 && overlap > 0.84f;
+                if ((sameLabel && overlap > 0.72f) || sameGeometry) { hit = i; break; }
             }
-            if (replace < 0) {
-                out.add(c);
-            } else {
-                Candidate old = out.get(replace);
-                int oldArea = Math.max(1, old.rect.width() * old.rect.height());
-                int newArea = Math.max(1, c.rect.width() * c.rect.height());
-                if ((c.node.isClickable() && !old.node.isClickable()) || newArea < oldArea) out.set(replace, c);
+            if (hit < 0) out.add(c);
+            else {
+                Candidate o = out.get(hit);
+                int oa = Math.max(1, o.rect.width() * o.rect.height());
+                int na = Math.max(1, c.rect.width() * c.rect.height());
+                if ((c.node.isClickable() && !o.node.isClickable()) || na < oa) out.set(hit, c);
             }
         }
         return out;
     }
 
     private boolean looksLikeIconNode(AccessibilityNodeInfo n, Rect r, String label, int w, int h) {
-        if (label.isEmpty()) return false;
-        if (!n.isClickable()) return false;
-        if (!n.isVisibleToUser()) return false;
-        // Ignore stale hidden-page nodes that remain in One UI's tree with old bounds. Keep a
-        // small off-screen margin so an icon can be cached just before it visibly enters.
-        if (r.right < -w * 0.12f || r.left > w * 1.12f) return false;
+        if (label.isEmpty() || !n.isClickable() || !n.isVisibleToUser()) return false;
+        if (r.right < -w * 0.18f || r.left > w * 1.18f) return false;
         int rw = r.width(), rh = r.height();
         if (rw < w * 0.055f || rw > w * 0.42f) return false;
         if (rh < h * 0.035f || rh > h * 0.22f) return false;
         int cy = r.centerY();
-        if (cy < h * 0.055f || cy > h * 0.985f) return false;
-        return true;
+        return cy >= h * 0.055f && cy <= h * 0.985f;
     }
 
-
     private Candidate chooseLeftBottom(ArrayList<Candidate> icons, int w, int h) {
-        int maxY = Integer.MIN_VALUE;
-        for (Candidate c : icons) {
-            int cx = c.rect.centerX(), cy = c.rect.centerY();
-            if (cy > h * 0.84f) continue; // dock
-            if (cx < -w * 0.18f || cx > w * 1.18f) continue;
-            maxY = Math.max(maxY, cy);
-        }
-        if (maxY == Integer.MIN_VALUE) return null;
-
         Candidate best = null;
-        int rowTolerance = Math.max(24, Math.round(h * 0.075f));
         for (Candidate c : icons) {
             int cx = c.rect.centerX(), cy = c.rect.centerY();
             if (cy > h * 0.84f) continue;
-            if (cx < -w * 0.18f || cx > w * 1.18f) continue;
-            if (cy < maxY - rowTolerance) continue;
-            if (best == null || cx < best.rect.centerX()
-                    || (cx == best.rect.centerX() && cy > best.rect.centerY())) {
-                best = c;
-            }
+            if (cx < -w * 0.10f || cx > w * 1.10f) continue;
+            if (best == null || cy > best.rect.centerY()
+                    || (cy == best.rect.centerY() && cx < best.rect.centerX())) best = c;
         }
         return best;
     }
 
     private Candidate chooseRightTop(ArrayList<Candidate> icons, int w, int h, Candidate avoid) {
-        int minY = Integer.MAX_VALUE;
-        for (Candidate c : icons) {
-            int cx = c.rect.centerX(), cy = c.rect.centerY();
-            if (cy > h * 0.84f) continue;
-            if (cx < -w * 0.18f || cx > w * 1.18f) continue;
-            minY = Math.min(minY, cy);
-        }
-        if (minY == Integer.MAX_VALUE) return null;
-
         Candidate best = null;
-        int rowTolerance = Math.max(24, Math.round(h * 0.075f));
         for (Candidate c : icons) {
             if (c == avoid && icons.size() > 1) continue;
             int cx = c.rect.centerX(), cy = c.rect.centerY();
             if (cy > h * 0.84f) continue;
-            if (cx < -w * 0.18f || cx > w * 1.18f) continue;
-            if (cy > minY + rowTolerance) continue;
-            if (best == null || cx > best.rect.centerX()
-                    || (cx == best.rect.centerX() && cy < best.rect.centerY())) {
-                best = c;
-            }
+            if (cx < -w * 0.10f || cx > w * 1.10f) continue;
+            if (best == null || cy < best.rect.centerY()
+                    || (cy == best.rect.centerY() && cx > best.rect.centerX())) best = c;
         }
-        if (best == null && avoid != null) best = avoid;
-        return best;
+        return best == null ? avoid : best;
     }
 
-    private void acquirePair(Candidate lb, Candidate rt, float basisPos, long now, int w) {
-        leftBottom.assign(lb, basisPos, w, now);
-        rightTop.assign(rt, basisPos, w, now);
-        lastUnifiedPosition = Float.NaN;
-        lastUnifiedMoveMs = now;
-        LauncherScrollBus.anchorReacquires++;
-        LauncherScrollBus.trackerState = "DUAL ANCHORS ACQUIRED";
-        sampleAnchors(now);
-    }
-    /**
-     * Store icon bounds in stable world coordinates.
-     *
-     * Snapshots remain PAGE-SCOPED. v0.18 blindly merged every
-     * later scan into one global list; after a page change that could keep stale nodes and then
-     * draw the old page's outlines on the new page. A settled scan replaces only that page, while
-     * a mid-swipe scan only adds/updates the visible portions of the incoming/outgoing pages.
-     */
-    private void publishIconSnapshot(ArrayList<Candidate> icons, float basisPos, int w) {
-        int pages = clampInt(prefs.getInt(Prefs.KEY_PAGE_COUNT, 4), 2, 9);
-        int h = Math.max(1, getResources().getDisplayMetrics().heightPixels);
-        ArrayList<LauncherScrollBus.IconBox> fresh = new ArrayList<>();
-
-        for (Candidate c : icons) {
-            boolean moves = c.rect.centerY() <= h * 0.84f;
-            float worldX = moves ? c.rect.centerX() + basisPos * w : c.rect.centerX();
-            int pageIndex = -1;
-            if (moves) {
-                pageIndex = (int) Math.floor(worldX / Math.max(1f, (float) w));
-                if (pageIndex < 0 || pageIndex >= pages) continue;
-            }
-            addOrReplaceFresh(fresh, new LauncherScrollBus.IconBox(
-                    worldX,
-                    c.rect.centerY(),
-                    c.rect.width(),
-                    c.rect.height(),
-                    c.label,
-                    moves,
-                    pageIndex));
+    private void publishTrack(AnchorTrack t) {
+        if ("LEFT-BOTTOM".equals(t.role)) {
+            LauncherScrollBus.anchorLeftBottomValid = t.valid;
+            LauncherScrollBus.anchorLeftBottomLabel = t.label;
+            LauncherScrollBus.anchorLeftBottomX = t.lastX == Integer.MIN_VALUE ? 0 : t.lastX;
+            LauncherScrollBus.anchorLeftBottomPosition = t.position;
+        } else {
+            LauncherScrollBus.anchorRightTopValid = t.valid;
+            LauncherScrollBus.anchorRightTopLabel = t.label;
+            LauncherScrollBus.anchorRightTopX = t.lastX == Integer.MIN_VALUE ? 0 : t.lastX;
+            LauncherScrollBus.anchorRightTopPosition = t.position;
         }
-
-        LauncherScrollBus.IconBox[] oldArray = LauncherScrollBus.iconSnapshot;
-        ArrayList<LauncherScrollBus.IconBox> merged = new ArrayList<>();
-        for (LauncherScrollBus.IconBox old : oldArray) merged.add(old);
-
-        boolean settled = Math.abs(basisPos - Math.round(basisPos)) < 0.065f;
-        int settledPage = clampInt(Math.round(basisPos), 0, pages - 1);
-
-        if (settled) {
-            // Replace the current page atomically. This makes manual "rescan" idempotent and
-            // prevents outlines from stacking on top of themselves.
-            for (int i = merged.size() - 1; i >= 0; i--) {
-                LauncherScrollBus.IconBox b = merged.get(i);
-                if (b.movesWithPages && b.pageIndex == settledPage) merged.remove(i);
-            }
-        }
-
-        // The dock is page-independent. Any scan that sees dock icons refreshes the dock rather
-        // than accumulating another copy.
-        boolean freshHasDock = false;
-        for (LauncherScrollBus.IconBox b : fresh) if (!b.movesWithPages) { freshHasDock = true; break; }
-        if (freshHasDock) {
-            for (int i = merged.size() - 1; i >= 0; i--) {
-                if (!merged.get(i).movesWithPages) merged.remove(i);
-            }
-        }
-
-        for (LauncherScrollBus.IconBox n : fresh) {
-            int hit = findSnapshotMatch(merged, n);
-            if (hit >= 0) merged.set(hit, n); else merged.add(n);
-        }
-
-        // Final geometry-level de-duplication protects against Samsung exposing both a clickable
-        // wrapper and its clickable child for the same icon on successive scans.
-        ArrayList<LauncherScrollBus.IconBox> clean = new ArrayList<>();
-        for (LauncherScrollBus.IconBox n : merged) addOrReplaceFresh(clean, n);
-
-        LauncherScrollBus.iconSnapshot = clean.toArray(new LauncherScrollBus.IconBox[0]);
-        LauncherScrollBus.iconSnapshotVersion++;
     }
 
-    private void addOrReplaceFresh(ArrayList<LauncherScrollBus.IconBox> boxes, LauncherScrollBus.IconBox n) {
-        int hit = findSnapshotMatch(boxes, n);
-        if (hit < 0) {
-            boxes.add(n);
-            return;
-        }
-        LauncherScrollBus.IconBox old = boxes.get(hit);
-        float oldArea = Math.max(1f, old.width * old.height);
-        float newArea = Math.max(1f, n.width * n.height);
-        // Prefer the tighter rectangle when Samsung publishes a wrapper + child pair.
-        if (newArea <= oldArea * 1.06f) boxes.set(hit, n);
-    }
-
-    private int findSnapshotMatch(ArrayList<LauncherScrollBus.IconBox> boxes, LauncherScrollBus.IconBox n) {
-        String nl = normalize(n.label);
-        for (int i = 0; i < boxes.size(); i++) {
-            LauncherScrollBus.IconBox o = boxes.get(i);
-            if (o.movesWithPages != n.movesWithPages) continue;
-            if (o.pageIndex != n.pageIndex) continue;
-
-            float dx = Math.abs(o.worldCenterX - n.worldCenterX);
-            float dy = Math.abs(o.centerY - n.centerY);
-            boolean sameLabel = normalize(o.label).equals(nl);
-            boolean sameSlot = dx < Math.max(34f, Math.min(o.width, n.width) * 0.42f)
-                    && dy < Math.max(34f, Math.min(o.height, n.height) * 0.34f);
-            if ((sameLabel && dx < Math.max(96f, n.width * 0.78f)
-                    && dy < Math.max(54f, n.height * 0.50f)) || sameSlot) {
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    private float overlapRatio(Rect a, Rect b) {
-        int l = Math.max(a.left, b.left), t = Math.max(a.top, b.top);
-        int r = Math.min(a.right, b.right), bot = Math.min(a.bottom, b.bottom);
-        int iw = Math.max(0, r - l), ih = Math.max(0, bot - t);
-        int inter = iw * ih;
-        if (inter <= 0) return 0f;
-        int aa = Math.max(1, a.width() * a.height());
-        int ba = Math.max(1, b.width() * b.height());
-        return inter / (float) Math.min(aa, ba);
+    private void publishUnifiedAnchor(AnchorTrack t) {
+        LauncherScrollBus.anchorLabel = t.label;
+        LauncherScrollBus.anchorLeft = t.rect.left;
+        LauncherScrollBus.anchorTop = t.rect.top;
+        LauncherScrollBus.anchorRight = t.rect.right;
+        LauncherScrollBus.anchorBottom = t.rect.bottom;
     }
 
     private void publishPage(int page, long now) {
-        if (LauncherScrollBus.authoritativePage == page) return;
         LauncherScrollBus.authoritativePage = page;
         LauncherScrollBus.authoritativePageUptimeMs = now;
         prefs.edit().putInt(Prefs.KEY_SAVED_PAGE, page).apply();
-        // At a newly settled page, refresh the cached layout once.
-        LauncherScrollBus.requestRescan();
-    }
-
-    private void clearAnchors(String reason) {
-        leftBottom.clear();
-        rightTop.clear();
-        lastUnifiedPosition = Float.NaN;
-        lastUnifiedMoveMs = 0L;
-        LauncherScrollBus.clearTracking(reason);
     }
 
     private String nodeLabel(AccessibilityNodeInfo n) {
@@ -707,8 +582,21 @@ public class LauncherAccessibilityService extends AccessibilityService {
         return s.toLowerCase(Locale.ROOT).replace('\u00a0', ' ').trim();
     }
 
-    private int clampInt(int v, int min, int max) {
-        return Math.max(min, Math.min(max, v));
+    private int pages() {
+        return clampInt(prefs.getInt(Prefs.KEY_PAGE_COUNT, 4), 2, 9);
+    }
+
+    private int clampInt(int v, int min, int max) { return Math.max(min, Math.min(max, v)); }
+
+    private float overlapRatio(Rect a, Rect b) {
+        int l = Math.max(a.left, b.left), t = Math.max(a.top, b.top);
+        int r = Math.min(a.right, b.right), bot = Math.min(a.bottom, b.bottom);
+        int iw = Math.max(0, r - l), ih = Math.max(0, bot - t);
+        int inter = iw * ih;
+        if (inter <= 0) return 0f;
+        int aa = Math.max(1, a.width() * a.height());
+        int ba = Math.max(1, b.width() * b.height());
+        return inter / (float) Math.min(aa, ba);
     }
 
     private static final class Candidate {
@@ -722,12 +610,34 @@ public class LauncherAccessibilityService extends AccessibilityService {
         }
     }
 
+    private static final class KnownMatch {
+        final Candidate c;
+        final LauncherScrollBus.IconBox b;
+        final float position;
+        KnownMatch(Candidate c, LauncherScrollBus.IconBox b, float position) {
+            this.c = c; this.b = b; this.position = position;
+        }
+    }
+
+    private static final class AnchorSample {
+        final boolean valid, changed;
+        final float position;
+        final long changedMs;
+        final Rect rect;
+        AnchorSample(boolean valid, boolean changed, float position, long changedMs, Rect rect) {
+            this.valid = valid; this.changed = changed; this.position = position;
+            this.changedMs = changedMs; this.rect = rect;
+        }
+        static AnchorSample invalid() { return new AnchorSample(false, false, 0f, 0L, new Rect()); }
+    }
 
     private final class AnchorTrack {
         final String role;
         AccessibilityNodeInfo node;
         String label = "";
-        float worldX = 0f;
+        int pageIndex = -1;
+        float restCenterX = 0f;
+        float restCenterY = 0f;
         int lastX = Integer.MIN_VALUE;
         int lastY = Integer.MIN_VALUE;
         long changedMs = 0L;
@@ -735,64 +645,12 @@ public class LauncherAccessibilityService extends AccessibilityService {
         float position = 0f;
         boolean valid = false;
         final Rect rect = new Rect();
-
         AnchorTrack(String role) { this.role = role; }
-
-        void assign(Candidate c, float basisPos, int w, long now) {
-            if (c == null) {
-                clear();
-                return;
-            }
-            node = c.node;
-            label = c.label;
-            worldX = c.rect.centerX() + basisPos * w;
-            lastX = Integer.MIN_VALUE;
-            lastY = Integer.MIN_VALUE;
-            changedMs = now;
-            position = basisPos;
-            rect.set(c.rect);
-            valid = true;
-            publishTrackDiagnostics(this);
-        }
-
-        void invalidate() {
-            node = null;
-            valid = false;
-        }
-
+        void invalidate() { node = null; valid = false; }
         void clear() {
-            node = null;
-            label = "";
-            worldX = 0f;
-            lastX = Integer.MIN_VALUE;
-            lastY = Integer.MIN_VALUE;
-            changedMs = 0L;
-            position = 0f;
-            rect.setEmpty();
-            valid = false;
-            publishTrackDiagnostics(this);
-        }
-    }
-
-    private static final class AnchorSample {
-        final AnchorTrack track;
-        final boolean valid;
-        final boolean changed;
-        final float position;
-        final long changedMs;
-        final Rect rect;
-
-        AnchorSample(AnchorTrack track, boolean valid, boolean changed, float position, long changedMs, Rect rect) {
-            this.track = track;
-            this.valid = valid;
-            this.changed = changed;
-            this.position = position;
-            this.changedMs = changedMs;
-            this.rect = rect;
-        }
-
-        static AnchorSample invalid(AnchorTrack track) {
-            return new AnchorSample(track, false, false, 0f, 0L, new Rect());
+            node = null; label = ""; pageIndex = -1; restCenterX = 0f; restCenterY = 0f;
+            lastX = Integer.MIN_VALUE; lastY = Integer.MIN_VALUE; changedMs = 0L;
+            position = 0f; rect.setEmpty(); valid = false; publishTrack(this);
         }
     }
 
