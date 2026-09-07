@@ -1,45 +1,12 @@
-# Iridescent Wallpaper v0.11 — Samsung PagedView physics
+# Iridescent Wallpaper v0.12
 
-## Что исправлено
+Focused regression-fix build.
 
-### Точная сетка из калибровочного скриншота
-При первом запуске v0.11 геометрия принудительно (один раз) переводится на значения пользователя для скриншота 709×1536:
+## Grid
+The grid editor/view code is restored to the v0.8 implementation. Existing v0.11 installs have incorrect geometry persisted, so v0.12 performs one one-time geometry restore to the exact v0.8 defaults. App-to-cell assignments and the editor screenshot are preserved. After that restore, the grid is not auto-migrated again.
 
-- 4 × 6
-- Сетка X: 164 px
-- Сетка Y: 256 px
-- Ширина ячейки: 175 px
-- Высота ячейки: 176 px
-- Зазор X: 75 px
-- Зазор Y: 117 px
-- Стекло: 36%
+## Motion fixes
+1. Glass no longer vanishes at page boundaries/overshoot. The renderer keeps one extra neighboring page alive on each side instead of drawing only floor/ceil pages.
+2. Removed the 3–4 px startup teleport. Crossing touch slop begins from a continuous zero displacement; the skipped slop distance is blended back over ~90 ms. The fixed +8 ms latency lead from v0.11 is removed; only measured event lag is compensated, and that compensation is ramped in.
 
-Старые версии уже сохраняли геометрию в SharedPreferences, поэтому простая смена DEFAULT-констант не меняла существующую установку. v0.11 имеет отдельную ревизию пресета и один раз перезаписывает только геометрию. Назначения приложений по ячейкам не удаляются.
-
-### Синхронизация движения
-Исследование исходников Samsung Launcher показало, что его Workspace построен поверх PagedView. В v0.11 модель движения приближена именно к Samsung PagedView:
-
-- используется обычный Android `getScaledTouchSlop()`;
-- до прохождения touch slop стекло не двигается — как и страница лаунчера;
-- после начала скролла первый участок до touch slop не включается в перевод страницы;
-- для компенсации задержки WallpaperService используется свежая кадровая скорость пальца, которая сразу меняет знак при развороте;
-- решение о переходе использует пороги PagedView (значимое движение 40%, возврат при обратном fling после 33%, fling threshold 500 dp/s, min snap 1500 dp/s);
-- после отпускания используется quintic ease-out `(t-1)^5 + 1`, как в Samsung PagedView;
-- accessibility не используется для покадрового движения и не может создавать ступеньки — она только проверяет конечную страницу.
-
-## Отладка
-Переключатель отладки сохранён. Плашка показывает FPS, источник позиции, BG/GLASS, A11Y и теперь также:
-
-- `lag Nms` — измеренная задержка события касания;
-- `slop Npx` — системный touch slop, который имитируется перед началом движения.
-
-## Что проверить
-1. Очень медленно сдвинуть страницу на несколько пикселей — стекло не должно начинать ехать раньше иконок.
-2. Медленно вести страницу дальше — стекло должно держаться ближе к иконкам.
-3. Вести в одну сторону и, не отпуская, резко вернуть палец — компенсация не должна продолжать тянуть стекло в старом направлении.
-4. Сделать короткий медленный свайп и отпустить — страница должна вернуться.
-5. Сделать обычный быстрый переход — после отпускания должна идти плавная quintic-анимация без редких A11Y-ступенек.
-
-Если даже после этого останется постоянная фазовая ошибка, следующий эксперимент — не угадывать offset вообще, а через AccessibilityNodeInfo отслеживать `boundsInScreen` реального значка One UI и вычислять фактическое смещение страницы по координате самого view. Это потребует более широкого accessibility-доступа и пока не гарантировано Samsung.
-
-- Fling дополнительно требует более 25 px суммарного движения, как в архивном Samsung `PagedView`.
+The v0.11 Samsung/Launcher3-style page snap and A11Y final-page verification remain otherwise unchanged. Debug mode remains available.

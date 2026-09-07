@@ -28,7 +28,7 @@ import java.util.ArrayList;
 import java.util.Locale;
 
 /**
- * v0.11: GPU renderer + Launcher3/PagedView-compatible paging physics.
+ * v0.12: v0.11 paging physics with continuity fixes for glass rendering.
  *
  * Samsung One UI does not publish WallpaperService offsets on the tested device, and
  * accessibility scroll samples are too sparse for frame-by-frame rendering. While the
@@ -86,6 +86,9 @@ public class ProbeWallpaperService extends WallpaperService {
         private long prevMoveMs = 0L;
         private boolean visualScrollStarted = false;
         private float visualScrollOriginX = 0f;
+        // Smoothly absorb the touch-slop distance instead of applying it as a one-frame jump.
+        private float visualScrollCatchupPx = 0f;
+        private long visualScrollStartMs = 0L;
         private int gestureBasePage = 0;
         private String lastDecision = "READY";
 
@@ -329,6 +332,8 @@ public class ProbeWallpaperService extends WallpaperService {
                         prevMoveMs = now;
                         visualScrollStarted = false;
                         visualScrollOriginX = touchX;
+                        visualScrollCatchupPx = 0f;
+                        visualScrollStartMs = 0L;
                         totalMotionPx = 0f;
                         predictedReleasePage = currentPage;
                         snapAnimating = false;
@@ -382,11 +387,9 @@ public class ProbeWallpaperService extends WallpaperService {
                             float absDy = Math.abs(touchY - downY);
                             if (absDx > touchSlopPx && absDx > absDy) {
                                 visualScrollStarted = true;
-                                // Samsung PagedView immediately feeds the SAME MOVE event into
-                                // scrollPageOnMoveEvent(), whose mLastMotionX is still the DOWN x.
-                                // So when slop is crossed the real icons catch up by the full
-                                // down->current displacement; they do NOT throw away the slop.
-                                visualScrollOriginX = downX;
+                                visualScrollOriginX = touchX;
+                                visualScrollCatchupPx = touchX - downX;
+                                visualScrollStartMs = now;
                             }
                         }
 
@@ -528,15 +531,17 @@ public class ProbeWallpaperService extends WallpaperService {
         private float launcherLikeVisualDx() {
             if (!visualScrollStarted) return 0f;
 
-            // PagedView resets its last-motion anchor when scrolling starts, so the initial
-            // touch-slop distance is not translated into page movement. This was a hidden
-            // phase error in v0.10: our glass started moving before the Samsung icons did.
-            float visualDx = touchX - visualScrollOriginX;
+            // Start from exactly zero at the frame scrolling begins. The distance already
+            // travelled while crossing touch slop is blended back in over ~90 ms, so glass
+            // reaches the same phase as the icons without a visible 3–4 px teleport.
+            float elapsedMs = Math.max(0f, SystemClock.uptimeMillis() - visualScrollStartMs);
+            float t = clamp(elapsedMs / 90f, 0f, 1f);
+            float smooth = t * t * (3f - 2f * t);
+            float visualDx = (touchX - visualScrollOriginX) + visualScrollCatchupPx * smooth;
 
-            // WallpaperService gets MotionEvents after launcher dispatch and can therefore be
-            // one or two frames late. Lead only by the RECENT frame velocity, not the smoothed
-            // release velocity. That way an immediate finger reversal also reverses the glass.
-            float leadSec = clamp((touchDeliveryLagMs + 8f) / 1000f, 0f, 0.032f);
+            // Keep only measured event-delivery compensation, and fade it in with the same
+            // ramp. v0.11 added a fixed +8 ms lead which was responsible for the startup hop.
+            float leadSec = clamp(touchDeliveryLagMs / 1000f, 0f, 0.018f) * smooth;
             return visualDx + previewVelocityX * leadSec;
         }
 
@@ -1054,10 +1059,16 @@ public class ProbeWallpaperService extends WallpaperService {
                 GLES20.glUniform2f(uSize, cw * w, ch * h);
                 GLES20.glUniform1f(uOpacity, opacity);
 
-                int p0 = clampInt((int) Math.floor(pos), 0, pages - 1);
-                int p1 = clampInt((int) Math.ceil(pos), 0, pages - 1);
-                drawGlassPage(w, h, pos, p0, pageCells[p0], x0, y0, cw + gx, ch + gy, uCenter);
-                if (p1 != p0) drawGlassPage(w, h, pos, p1, pageCells[p1], x0, y0, cw + gx, ch + gy, uCenter);
+                // Do not draw only floor/ceil. During snap overshoot or A11Y retargeting an
+                // icon from the previous page can still be partially visible while pos has
+                // already crossed the integer boundary. Keeping one extra page on each side
+                // prevents its glass from vanishing mid-transition.
+                int first = clampInt((int) Math.floor(pos) - 1, 0, pages - 1);
+                int last = clampInt((int) Math.ceil(pos) + 1, 0, pages - 1);
+                for (int page = first; page <= last; page++) {
+                    drawGlassPage(w, h, pos, page, pageCells[page],
+                            x0, y0, cw + gx, ch + gy, uCenter);
+                }
             }
 
             private void drawGlassPage(int w, int h, float pos, int page, ArrayList<Cell> cells,
@@ -1100,7 +1111,7 @@ public class ProbeWallpaperService extends WallpaperService {
                 debugPaint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
                 debugPaint.setTextSize(54f);
                 debugPaint.setColor(Color.WHITE);
-                debugCanvas.drawText("GPU Samsung PagedView v0.11", 38, 68, debugPaint);
+                debugCanvas.drawText("GPU Samsung PagedView v0.12", 38, 68, debugPaint);
                 debugPaint.setTypeface(android.graphics.Typeface.DEFAULT);
                 debugPaint.setTextSize(36f);
 

@@ -12,7 +12,10 @@ public final class Prefs {
     public static final String KEY_CONFIG_GENERATION = "config_generation";
     public static final String KEY_SWIPE_SENSITIVITY = "swipe_sensitivity";
     public static final String KEY_SHOW_DEBUG = "show_debug";
-    public static final String KEY_GRID_PRESET_REV = "grid_preset_rev";
+
+    // v0.12 only: v0.11 overwrote the user's geometry with a bad preset.
+    // Restore the exact v0.8 geometry once, then leave the grid alone forever.
+    public static final String KEY_V08_GRID_RESTORE_DONE = "v08_grid_restore_done";
 
     public static final String KEY_GRID_COLS = "grid_cols";
     public static final String KEY_GRID_ROWS = "grid_rows";
@@ -33,18 +36,18 @@ public final class Prefs {
     public static final String KEY_GRID_STEP_Y = "grid_step_y";
     public static final String KEY_GLASS_SIZE = "glass_size";
 
-    // v0.9 defaults copied from the user's calibrated 709x1536 screenshot:
-    // X=164 px, Y=256 px, cell=175x176 px, gaps=75x117 px.
+    // Defaults tuned to the user's 709x1536 / 4-column One UI screenshot.
     public static final int DEFAULT_COLS = 4;
     public static final int DEFAULT_ROWS = 6;
-    public static final float DEFAULT_X0 = 164f / 709f;
-    public static final float DEFAULT_Y0 = 256f / 1536f;
-    public static final float DEFAULT_CELL_WIDTH = 175f / 709f;
-    public static final float DEFAULT_CELL_HEIGHT = 176f / 1536f;
-    public static final float DEFAULT_GAP_X = 75f / 709f;
-    public static final float DEFAULT_GAP_Y = 117f / 1536f;
+    public static final float DEFAULT_X0 = 0.154f; // center of first cell, normalized by screen width
+    public static final float DEFAULT_Y0 = 0.109f; // center of first cell, normalized by screen height
+
+    // Same visual geometry as v0.5, expressed as width/height + edge gaps.
+    public static final float DEFAULT_CELL_WIDTH = 0.151f;
+    public static final float DEFAULT_CELL_HEIGHT = 0.06972f; // 0.151 * 709 / 1536
+    public static final float DEFAULT_GAP_X = 0.078f;         // 0.229 - 0.151
+    public static final float DEFAULT_GAP_Y = 0.05828f;      // 0.128 - 0.06972
     public static final float DEFAULT_GLASS_OPACITY = 0.36f;
-    public static final int GRID_PRESET_REV = 11;
 
     // Legacy defaults.
     public static final float DEFAULT_STEP_X = 0.229f;
@@ -52,11 +55,10 @@ public final class Prefs {
     public static final float DEFAULT_GLASS_SIZE = 0.151f;
 
     public static void ensureV06GridDefaults(SharedPreferences prefs, int screenW, int screenH) {
-        // v0.11: the user supplied the calibrated 709x1536 geometry explicitly.
-        // Older builds could keep migrated v0.5/v0.6 values in SharedPreferences, so
-        // merely changing DEFAULT_* did not actually change an existing install.
-        // Force the requested geometry ONCE on upgrade, without touching cell/app assignments.
-        if (prefs.getInt(KEY_GRID_PRESET_REV, 0) < GRID_PRESET_REV) {
+        // Existing v0.11 installs already have the incorrect geometry persisted, so merely
+        // restoring the old constants is not enough. Reset geometry ONCE to v0.8 values.
+        // Cell/app assignments and screenshot URI are intentionally preserved.
+        if (!prefs.getBoolean(KEY_V08_GRID_RESTORE_DONE, false)) {
             prefs.edit()
                     .putInt(KEY_GRID_COLS, DEFAULT_COLS)
                     .putInt(KEY_GRID_ROWS, DEFAULT_ROWS)
@@ -67,7 +69,7 @@ public final class Prefs {
                     .putFloat(KEY_GAP_X, DEFAULT_GAP_X)
                     .putFloat(KEY_GAP_Y, DEFAULT_GAP_Y)
                     .putFloat(KEY_GLASS_OPACITY, DEFAULT_GLASS_OPACITY)
-                    .putInt(KEY_GRID_PRESET_REV, GRID_PRESET_REV)
+                    .putBoolean(KEY_V08_GRID_RESTORE_DONE, true)
                     .apply();
             return;
         }

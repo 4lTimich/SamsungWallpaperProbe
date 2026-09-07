@@ -78,12 +78,12 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView title = text("Iridescent Wallpaper Lab v0.11", 25f, Color.BLACK, true);
+        TextView title = text("Iridescent Wallpaper Lab v0.12", 25f, Color.BLACK, true);
         title.setGravity(Gravity.CENTER);
         root.addView(title, matchWrap());
 
         TextView body = text(
-                "v0.11: движение стекла теперь повторяет модель Samsung PagedView: сначала учитывается системный touch slop, затем стекло следует за реальным движением пальца с компенсацией задержки WallpaperService. После отпускания используется quintic-анимация Samsung/Launcher3, а служба One UI только проверяет конечную страницу.",
+                "v0.12: сетка возвращена к поведению v0.8. В движении исправлены два локальных дефекта: стекло больше не должно исчезать на границе страниц, а начало свайпа плавно набирает компенсацию вместо скачка на несколько пикселей.",
                 16f, Color.DKGRAY, false);
         body.setGravity(Gravity.CENTER);
         body.setPadding(0, dp(14), 0, dp(20));
@@ -152,7 +152,7 @@ public class MainActivity extends Activity {
         root.addView(wallpaper, matchWrap());
 
         TextView note = text(
-                "Samsung One UI не отдаёт WallpaperService настоящий page offset. Поэтому v0.11 больше не пытается рисовать редкие accessibility-сэмплы как кадры: во время пальца мы имитируем собственный Samsung PagedView, а после отпускания повторяем его quintic snap. Accessibility остаётся только каналом проверки конечной страницы. Отладку можно включать/выключать как раньше.",
+                "Геометрию редактора больше не меняю: v0.12 один раз возвращает значения v0.8 и дальше сохраняет твои ручные настройки. Назначения приложений по ячейкам при восстановлении геометрии не удаляются. Отладка остаётся доступной.",
                 14f, Color.DKGRAY, false);
         note.setGravity(Gravity.CENTER);
         note.setPadding(0, dp(18), 0, 0);
