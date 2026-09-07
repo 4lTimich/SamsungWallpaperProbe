@@ -26,11 +26,12 @@ import java.util.ArrayList;
 import java.util.Locale;
 
 /**
- * v0.7: GPU wallpaper renderer + experimental real One UI scroll source.
+ * v0.9: GPU wallpaper renderer with smooth hybrid One UI tracking.
  *
- * If the optional accessibility service reports a sane absolute scrollX/maxScrollX
- * for One UI Home, glass follows that real launcher position. Otherwise the engine
- * falls back to the previous raw-touch virtual-page model.
+ * While the finger is down, glass follows raw touch 1:1 because that is the smoothest
+ * signal Android gives a live wallpaper. Accessibility data is used as an authority
+ * and post-release target, but sparse A11Y samples are never copied straight to the
+ * visible glass position; they are interpolated by a 60 fps critically-damped spring.
  */
 public class ProbeWallpaperService extends WallpaperService {
 
@@ -56,9 +57,11 @@ public class ProbeWallpaperService extends WallpaperService {
         private float swipeSensitivity = 1.80f;
         private boolean showDebug = false;
 
-        // Visual positions.
+        // Visual positions and their smooth targets.
         private float virtualPosition = 0f;
         private float glassPosition = 0f;
+        private float virtualTargetPosition = 0f;
+        private float glassTargetPosition = 0f;
         private float visualVelocity = 0f;
         private float glassVelocity = 0f;
         private float motionEnergy = 0f;
@@ -171,6 +174,8 @@ public class ProbeWallpaperService extends WallpaperService {
                     targetPage = saved;
                     virtualPosition = saved;
                     glassPosition = saved;
+                    virtualTargetPosition = saved;
+                    glassTargetPosition = saved;
                     realPosition = saved;
                     visualVelocity = 0f;
                     glassVelocity = 0f;
@@ -283,11 +288,11 @@ public class ProbeWallpaperService extends WallpaperService {
                         prevMoveX = touchX;
                         prevMoveMs = now;
                         if (LauncherScrollBus.serviceConnected) {
-                            // Until One UI gives us scrollX/deltaX, use raw touch only as a
-                            // temporary visual preview. It is never allowed to choose a page.
-                            if (!a11yContinuousThisGesture || now - lastA11yMotionMs > 90L) {
-                                updateAuthoritativeTouchPreview();
-                            }
+                            // v0.9: while the finger is physically down, TOUCH always wins
+                            // visually. Accessibility samples on One UI are too sparse/jagged
+                            // for direct rendering; they are still collected in the background
+                            // and become authoritative after release.
+                            updateAuthoritativeTouchPreview();
                         } else {
                             updateFallbackDraggedPositions();
                         }
@@ -305,8 +310,14 @@ public class ProbeWallpaperService extends WallpaperService {
                             awaitingA11yDecision = true;
                             a11yReleaseMs = now;
                             targetPage = currentPage;
+                            // Hold exactly where the finger released. A11Y will move the
+                            // TARGET from here; the visible glass is eased at render rate.
+                            glassTargetPosition = glassPosition;
+                            virtualTargetPosition = virtualPosition;
+                            glassVelocity = 0f;
+                            visualVelocity = 0f;
                             lastDecision = "WAIT ONE UI — NO PAGE GUESS";
-                            if (!a11yContinuousThisGesture) offsetSource = "A11Y WAIT";
+                            offsetSource = "A11Y WAIT";
                         } else {
                             finishFallbackGesture(event.getActionMasked() == MotionEvent.ACTION_CANCEL);
                         }
@@ -319,10 +330,18 @@ public class ProbeWallpaperService extends WallpaperService {
         private void updateAuthoritativeTouchPreview() {
             int w = Math.max(1, surfaceW);
             float rawPageDelta = -touchDx / w;
-            glassPosition = applyEdgeRubber(gestureBasePage + rawPageDelta, 0.20f);
-            virtualPosition = applyEdgeRubber(gestureBasePage + rawPageDelta * swipeSensitivity, 0.28f);
-            // Page state intentionally unchanged. This preview follows the finger both
-            // forward and backward and disappears as an authority source at release.
+            float glass = applyEdgeRubber(gestureBasePage + rawPageDelta, 0.20f);
+            float bg = applyEdgeRubber(gestureBasePage + rawPageDelta * swipeSensitivity, 0.28f);
+            // Direct assignment is intentional: MotionEvent is the highest-rate signal we
+            // have while dragging and follows reversals immediately. No A11Y jitter here.
+            glassPosition = glass;
+            glassTargetPosition = glass;
+            virtualPosition = bg;
+            virtualTargetPosition = bg;
+            glassVelocity = 0f;
+            visualVelocity = 0f;
+            offsetSource = "TOUCH 1:1 + A11Y AUTH";
+            // Page state intentionally unchanged. Accessibility alone can commit it.
         }
 
         private void updateFallbackDraggedPositions() {
@@ -330,6 +349,8 @@ public class ProbeWallpaperService extends WallpaperService {
             float rawPageDelta = -touchDx / w;
             virtualPosition = applyEdgeRubber(gestureBasePage + rawPageDelta * swipeSensitivity, 0.28f);
             glassPosition = applyEdgeRubber(gestureBasePage + rawPageDelta, 0.20f);
+            virtualTargetPosition = virtualPosition;
+            glassTargetPosition = glassPosition;
             offsetSource = "VIRTUAL TOUCH";
         }
 
@@ -348,8 +369,10 @@ public class ProbeWallpaperService extends WallpaperService {
             int proposedPage = clampInt(gestureBasePage + direction, 0, pageCount - 1);
             currentPage = proposedPage;
             targetPage = proposedPage;
-            visualVelocity = clamp(velocityPages * 0.24f, -2.15f, 2.15f);
-            glassVelocity = clamp((-touchVelocityX / w) * 0.18f, -1.40f, 1.40f);
+            virtualTargetPosition = proposedPage;
+            glassTargetPosition = proposedPage;
+            visualVelocity = clamp(velocityPages * 0.20f, -1.80f, 1.80f);
+            glassVelocity = clamp((-touchVelocityX / w) * 0.12f, -1.10f, 1.10f);
             lastDecision = direction == 0 ? "RETURN PAGE " + (currentPage + 1)
                     : String.format(Locale.US, "%s -> PAGE %d", fromCancel ? "FLING" : "SWIPE", currentPage + 1);
             saveStablePage();
@@ -394,6 +417,8 @@ public class ProbeWallpaperService extends WallpaperService {
             final float w = Math.max(1f, surfaceW);
 
             // Best case: One UI exposes an absolute horizontal scroll position.
+            // v0.9 never copies the sparse sample straight into glassPosition. During
+            // touch we render touch 1:1; after release this becomes a smooth target.
             if (isScrollEvent && a11yMaxScrollX > 0 && a11yScrollX >= 0 && pageCount > 1) {
                 float stepPx = a11yMaxScrollX / (float) (pageCount - 1);
                 boolean plausible = stepPx >= w * 0.45f && stepPx <= w * 1.85f
@@ -402,55 +427,56 @@ public class ProbeWallpaperService extends WallpaperService {
                     float p = clamp(a11yScrollX / stepPx, 0f, pageCount - 1f);
                     synchronized (stateLock) {
                         realPosition = p;
-                        glassPosition = p;
-                        float base = dragging ? gestureBasePage : currentPage;
-                        virtualPosition = applyEdgeRubber(base + (p - base) * swipeSensitivity, 0.24f);
-                        visualVelocity = 0f;
-                        glassVelocity = 0f;
+                        if (!dragging) {
+                            glassTargetPosition = p;
+                            float base = currentPage;
+                            virtualTargetPosition = applyEdgeRubber(
+                                    base + (p - base) * swipeSensitivity, 0.24f);
+                            offsetSource = "A11Y REAL → SMOOTH";
+                        }
                         realOffsetLocked = true;
                         a11yContinuousThisGesture = true;
                         lastA11yMotionMs = nowMs;
                         lastRealEventMs = nowMs;
                         realSettledForEvent = false;
-                        offsetSource = "A11Y REAL";
-                        lastDecision = "ONE UI ABSOLUTE SCROLL";
+                        lastDecision = dragging ? "TOUCH 1:1 / A11Y OBSERVED" : "ONE UI ABSOLUTE TARGET";
                     }
                     handleA11yQuietPeriod(nowMs);
                     return;
                 }
             }
 
-            // Second-best case: many launchers expose scrollDeltaX even when scrollX/maxScrollX
-            // are useless. Integrating the launcher's OWN delta tracks reversals and post-release
-            // animation much better than guessing from finger distance.
+            // Second-best case: One UI exposes only scrollDeltaX. Integrate it into an
+            // observed target, then interpolate at render rate. This removes the 5–15 Hz
+            // staircase that was visible in v0.8 when samples were rendered directly.
             if (isScrollEvent && a11yDeltaX != 0 && Math.abs(a11yDeltaX) <= w * 1.50f) {
                 synchronized (stateLock) {
                     if (a11yDeltaSign == 0) {
-                        float expected = Math.abs(touchVelocityX) > 30f ? -touchVelocityX : -touchDx; // finger left => page coordinate grows
+                        float expected = Math.abs(touchVelocityX) > 30f ? -touchVelocityX : -touchDx;
                         if (Math.abs(expected) > 8f) {
                             a11yDeltaSign = ((expected > 0f) == (a11yDeltaX > 0)) ? 1 : -1;
                         } else {
                             a11yDeltaSign = 1;
                         }
                     }
-                    if (!a11yContinuousThisGesture && dragging) {
-                        realPosition = gestureBasePage;
+                    if (!a11yContinuousThisGesture) {
+                        realPosition = dragging ? gestureBasePage : glassPosition;
                     }
                     realPosition = applyEdgeRubber(
                             realPosition + (a11yDeltaX / w) * a11yDeltaSign, 0.20f);
-                    glassPosition = realPosition;
-                    float base = dragging ? gestureBasePage : currentPage;
-                    virtualPosition = applyEdgeRubber(
-                            base + (realPosition - base) * swipeSensitivity, 0.24f);
-                    visualVelocity = 0f;
-                    glassVelocity = 0f;
+                    if (!dragging) {
+                        glassTargetPosition = realPosition;
+                        float base = currentPage;
+                        virtualTargetPosition = applyEdgeRubber(
+                                base + (realPosition - base) * swipeSensitivity, 0.24f);
+                        offsetSource = "A11Y DELTA → SMOOTH";
+                    }
                     realOffsetLocked = true;
                     a11yContinuousThisGesture = true;
                     lastA11yMotionMs = nowMs;
                     lastRealEventMs = nowMs;
                     realSettledForEvent = false;
-                    offsetSource = "A11Y DELTA";
-                    lastDecision = "ONE UI DELTA SCROLL";
+                    lastDecision = dragging ? "TOUCH 1:1 / A11Y DELTA OBS" : "ONE UI DELTA TARGET";
                 }
             }
 
@@ -474,16 +500,15 @@ public class ProbeWallpaperService extends WallpaperService {
             currentPage = settled;
             targetPage = settled;
             realPosition = settled;
-            // Snap while glass is faded/settling; this prevents a visible wrong-page slide.
-            glassPosition = settled;
-            virtualPosition = settled;
-            visualVelocity = 0f;
-            glassVelocity = 0f;
+            // v0.9: page confirmation moves only the TARGET. Never snap the glass.
+            // The 60 fps spring closes the remaining distance smoothly.
+            glassTargetPosition = settled;
+            virtualTargetPosition = settled;
             awaitingA11yDecision = false;
             realSettledForEvent = true;
             realOffsetLocked = true;
             a11yContinuousThisGesture = false;
-            offsetSource = "A11Y PAGE";
+            offsetSource = "A11Y PAGE → EASE";
             lastDecision = reason + " ✓";
             LauncherScrollBus.authoritativePage = settled;
             LauncherScrollBus.authoritativePageUptimeMs = SystemClock.uptimeMillis();
@@ -514,10 +539,10 @@ public class ProbeWallpaperService extends WallpaperService {
                 synchronized (stateLock) {
                     targetPage = currentPage;
                     realPosition = currentPage;
-                    visualVelocity = 0f;
-                    glassVelocity = 0f;
+                    glassTargetPosition = currentPage;
+                    virtualTargetPosition = currentPage;
                     awaitingA11yDecision = false;
-                    offsetSource = "A11Y HOLD";
+                    offsetSource = "A11Y HOLD → EASE BACK";
                     lastDecision = "NO ONE UI PAGE CHANGE — RETURN";
                 }
             }
@@ -525,19 +550,25 @@ public class ProbeWallpaperService extends WallpaperService {
 
         private void advanceFallbackPhysics(float dt) {
             synchronized (stateLock) {
-                boolean serviceOn = LauncherScrollBus.serviceConnected;
                 if (!dragging) {
-                    // When accessibility is on, targetPage is authoritative only. During
-                    // WAIT we deliberately fade the glass rather than show a visibly wrong
-                    // approximation of One UI's post-release animation.
-                    if (!serviceOn || !a11yContinuousThisGesture) {
-                        float bgD = targetPage - virtualPosition;
-                        visualVelocity += (bgD * 42f - visualVelocity * 10.8f) * dt;
-                        virtualPosition += visualVelocity * dt;
+                    // Every sparse A11Y sample changes a target; the visible values are
+                    // integrated every render frame. Damping is slightly over-critical so
+                    // there is no oscillation/stair-step, but the response remains quick.
+                    float bgD = virtualTargetPosition - virtualPosition;
+                    visualVelocity += (bgD * 78f - visualVelocity * 18.5f) * dt;
+                    virtualPosition += visualVelocity * dt;
 
-                        float glassD = targetPage - glassPosition;
-                        glassVelocity += (glassD * 68f - glassVelocity * 15.8f) * dt;
-                        glassPosition += glassVelocity * dt;
+                    float glassD = glassTargetPosition - glassPosition;
+                    glassVelocity += (glassD * 118f - glassVelocity * 22.5f) * dt;
+                    glassPosition += glassVelocity * dt;
+
+                    if (Math.abs(bgD) < 0.0008f && Math.abs(visualVelocity) < 0.006f) {
+                        virtualPosition = virtualTargetPosition;
+                        visualVelocity = 0f;
+                    }
+                    if (Math.abs(glassD) < 0.0007f && Math.abs(glassVelocity) < 0.006f) {
+                        glassPosition = glassTargetPosition;
+                        glassVelocity = 0f;
                     }
                 }
 
@@ -547,13 +578,9 @@ public class ProbeWallpaperService extends WallpaperService {
                 float response = desired > motionEnergy ? 12f : 4.3f;
                 motionEnergy += (desired - motionEnergy) * clamp(dt * response, 0f, 1f);
 
-                boolean exactMotionNow = a11yContinuousThisGesture
-                        && SystemClock.uptimeMillis() - lastA11yMotionMs < 130L;
-                float desiredGlassVisibility = (serviceOn && awaitingA11yDecision && !exactMotionNow)
-                        ? 0.08f : 1f;
-                float visResponse = desiredGlassVisibility < glassVisibility ? 18f : 10f;
-                glassVisibility += (desiredGlassVisibility - glassVisibility)
-                        * clamp(dt * visResponse, 0f, 1f);
+                // v0.8 hid glass while waiting, which looked like another stutter. Keep it
+                // fully visible and let the smooth target correction do the work instead.
+                glassVisibility += (1f - glassVisibility) * clamp(dt * 14f, 0f, 1f);
             }
         }
 
@@ -819,14 +846,14 @@ public class ProbeWallpaperService extends WallpaperService {
                 debugPaint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
                 debugPaint.setTextSize(54f);
                 debugPaint.setColor(Color.WHITE);
-                debugCanvas.drawText("GPU + A11Y Authority v0.8", 38, 68, debugPaint);
+                debugCanvas.drawText("GPU Smooth Hybrid v0.9", 38, 68, debugPaint);
                 debugPaint.setTypeface(android.graphics.Typeface.DEFAULT);
                 debugPaint.setTextSize(36f);
 
                 String line1, line2, line3, line4, line5;
                 synchronized (stateLock) {
                     line1 = String.format(Locale.US, "FPS %.1f   SOURCE %s", measuredFps, offsetSource);
-                    line2 = String.format(Locale.US, "BG %.3f GLASS %.3f VIS %.2f PAGE %d/%d", virtualPosition, glassPosition, glassVisibility, currentPage + 1, pageCount);
+                    line2 = String.format(Locale.US, "BG %.3f→%.3f  GLASS %.3f→%.3f  P %d/%d", virtualPosition, virtualTargetPosition, glassPosition, glassTargetPosition, currentPage + 1, pageCount);
                     line3 = String.format(Locale.US, "A11Y x=%d max=%d dx=%d", a11yScrollX, a11yMaxScrollX, a11yDeltaX);
                     line4 = String.format(Locale.US, "idx %d>%d count=%d  %s", a11yFrom, a11yTo, a11yCount, trim(a11yClass, 26));
                     line5 = trim(lastDecision + (a11ySummary.isEmpty() ? "" : " | " + a11ySummary), 72);

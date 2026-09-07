@@ -90,7 +90,7 @@ public class GridEditorActivity extends Activity implements GlassGridView.CellTa
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView title = text("Редактор сетки стекла v0.8", 24f, Color.BLACK, true);
+        TextView title = text("Редактор сетки стекла v0.9", 24f, Color.BLACK, true);
         title.setGravity(Gravity.CENTER);
         root.addView(title, matchWrap());
 
@@ -207,7 +207,7 @@ public class GridEditorActivity extends Activity implements GlassGridView.CellTa
                 v -> changeOpacity(0.05f)), matchWrap());
 
         Button reset = new Button(this);
-        reset.setText("СБРОСИТЬ ГЕОМЕТРИЮ К 4×6");
+        reset.setText("СБРОСИТЬ К СЕТКЕ СО СКРИНА (4×6)");
         reset.setOnClickListener(v -> resetGridDefaults());
         LinearLayout.LayoutParams resetParams = matchWrap();
         resetParams.setMargins(0, dp(12), 0, dp(8));
@@ -222,7 +222,7 @@ public class GridEditorActivity extends Activity implements GlassGridView.CellTa
         root.addView(save, matchWrap());
 
         TextView bottom = text(
-                "Для твоего скриншота: сначала попаданием первой ячейки выставь Сетка X/Y, потом ширину/высоту, и только после этого зазоры X/Y — они определяют накопление ошибки к 4-й колонке и нижним рядам.",
+                "По умолчанию теперь стоят значения с твоего скриншота 709×1536: X 164, Y 256, ячейка 175×176, зазоры 75×117 px. Кнопка сброса возвращает именно к ним.",
                 13.5f, Color.DKGRAY, false);
         bottom.setGravity(Gravity.CENTER);
         bottom.setPadding(0, dp(12), 0, 0);

@@ -1,34 +1,36 @@
-# Iridescent Wallpaper v0.8 — Accessibility authority + delta tracking
+# Iridescent Wallpaper v0.9 — Smooth Hybrid
 
-This build addresses four v0.7 issues.
+v0.9 fixes the main regression in v0.8: accessibility scroll events from One UI are sparse and were being copied too directly into the visible glass position, which made motion look stepped/jagged even when GPU FPS was high.
 
-## 1. No virtual page commit while accessibility is enabled
-When `One UI Offset Probe` is connected, raw touch is only a temporary visual preview. It can no longer decide that a page changed. The page is committed only by:
-- a plausible absolute One UI `scrollX/maxScrollX`, or
-- integrated One UI `scrollDeltaX` settling very close to a page, or
-- an authoritative One UI page-index scroll event.
+## Motion model
 
-If the user drags forward, returns the finger, and releases without One UI confirming a new page, the wallpaper returns to the already-known page instead of inventing a transition.
+When the accessibility service is ON:
 
-## 2. Better continuous movement
-v0.8 now uses `AccessibilityEvent.getScrollDeltaX()` when absolute `scrollX` is unavailable. This is the launcher's own scrolling delta, so reversals and post-release movement can track much closer than the old finger-distance heuristic.
+- While the finger is down, glass follows raw wallpaper touch **1:1**. This is the smoothest signal and immediately follows reversals.
+- Accessibility scrollX/scrollDeltaX is still observed, but it does **not** overwrite the visible glass while dragging.
+- After release, A11Y data changes only a **target position**.
+- The visible glass interpolates toward that target every GPU frame with an over-damped spring.
+- A confirmed One UI page also changes only the target; no snap is performed.
+- If One UI reports no page change, the target becomes the already-known page and glass eases back smoothly.
+- Glass is no longer faded while waiting for a One UI decision.
 
-If One UI exposes neither useful absolute scroll nor useful deltas, v0.8 enters a safe hybrid mode: touch previews the drag, then glass briefly fades during the uncertain post-release animation and reappears on the page confirmed by One UI. This avoids visibly sliding glass to the wrong place.
+The accessibility service remains authoritative for committing the logical page. The old virtual page heuristic is used only when the service is disabled.
 
-## 3. Page-specific grid editing made explicit
-The grid editor opens on the last page confirmed by One UI when available. It now has a prominent `РЕДАКТИРУЕТСЯ СТРАНИЦА` control and a button `ВЗЯТЬ ТЕКУЩУЮ СТРАНИЦУ ИЗ ONE UI`.
-Assignments remain stored separately per page.
+## Default grid preset
 
-## 4. Debug overlay orientation fixed
-The OpenGL debug texture no longer applies the extra vertical flip from v0.7.
+The default/reset grid is now copied from the user's calibrated 709×1536 screenshot:
 
-## Debug sources
-- `A11Y REAL` — absolute One UI scroll position is available.
-- `A11Y DELTA` — One UI scroll deltas are being integrated.
-- `A11Y PAGE` — final page came from One UI.
-- `A11Y WAIT` — waiting for One UI; no virtual guess is allowed.
-- `A11Y HOLD` — no page change was confirmed; return to the known page.
-- `VIRTUAL TOUCH` — accessibility service is off, so legacy fallback is active.
+- 4 columns × 6 rows
+- Grid X: 164 px
+- Grid Y: 256 px
+- Cell width: 175 px
+- Cell height: 176 px
+- Gap X: 75 px
+- Gap Y: 117 px
+- Glass opacity: 36%
 
-## Build
-The GitHub Actions artifact is `IridescentWallpaper-v0.8-APK`.
+The reset button in the grid editor returns to these exact normalized values.
+
+## Debug
+
+Debug remains available. The second line now shows current → target positions for both background and glass, making it easier to see whether visible jitter comes from input samples or the smoother.

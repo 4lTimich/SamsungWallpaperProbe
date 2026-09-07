@@ -32,17 +32,16 @@ public final class Prefs {
     public static final String KEY_GRID_STEP_Y = "grid_step_y";
     public static final String KEY_GLASS_SIZE = "glass_size";
 
-    // Defaults tuned to the user's 709x1536 / 4-column One UI screenshot.
+    // v0.9 defaults copied from the user's calibrated 709x1536 screenshot:
+    // X=164 px, Y=256 px, cell=175x176 px, gaps=75x117 px.
     public static final int DEFAULT_COLS = 4;
     public static final int DEFAULT_ROWS = 6;
-    public static final float DEFAULT_X0 = 0.154f; // center of first cell, normalized by screen width
-    public static final float DEFAULT_Y0 = 0.109f; // center of first cell, normalized by screen height
-
-    // Same visual geometry as v0.5, expressed as width/height + edge gaps.
-    public static final float DEFAULT_CELL_WIDTH = 0.151f;
-    public static final float DEFAULT_CELL_HEIGHT = 0.06972f; // 0.151 * 709 / 1536
-    public static final float DEFAULT_GAP_X = 0.078f;         // 0.229 - 0.151
-    public static final float DEFAULT_GAP_Y = 0.05828f;      // 0.128 - 0.06972
+    public static final float DEFAULT_X0 = 164f / 709f;
+    public static final float DEFAULT_Y0 = 256f / 1536f;
+    public static final float DEFAULT_CELL_WIDTH = 175f / 709f;
+    public static final float DEFAULT_CELL_HEIGHT = 176f / 1536f;
+    public static final float DEFAULT_GAP_X = 75f / 709f;
+    public static final float DEFAULT_GAP_Y = 117f / 1536f;
     public static final float DEFAULT_GLASS_OPACITY = 0.36f;
 
     // Legacy defaults.
