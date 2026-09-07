@@ -12,6 +12,7 @@ public final class Prefs {
     public static final String KEY_CONFIG_GENERATION = "config_generation";
     public static final String KEY_SWIPE_SENSITIVITY = "swipe_sensitivity";
     public static final String KEY_SHOW_DEBUG = "show_debug";
+    public static final String KEY_GRID_PRESET_REV = "grid_preset_rev";
 
     public static final String KEY_GRID_COLS = "grid_cols";
     public static final String KEY_GRID_ROWS = "grid_rows";
@@ -43,6 +44,7 @@ public final class Prefs {
     public static final float DEFAULT_GAP_X = 75f / 709f;
     public static final float DEFAULT_GAP_Y = 117f / 1536f;
     public static final float DEFAULT_GLASS_OPACITY = 0.36f;
+    public static final int GRID_PRESET_REV = 11;
 
     // Legacy defaults.
     public static final float DEFAULT_STEP_X = 0.229f;
@@ -50,6 +52,26 @@ public final class Prefs {
     public static final float DEFAULT_GLASS_SIZE = 0.151f;
 
     public static void ensureV06GridDefaults(SharedPreferences prefs, int screenW, int screenH) {
+        // v0.11: the user supplied the calibrated 709x1536 geometry explicitly.
+        // Older builds could keep migrated v0.5/v0.6 values in SharedPreferences, so
+        // merely changing DEFAULT_* did not actually change an existing install.
+        // Force the requested geometry ONCE on upgrade, without touching cell/app assignments.
+        if (prefs.getInt(KEY_GRID_PRESET_REV, 0) < GRID_PRESET_REV) {
+            prefs.edit()
+                    .putInt(KEY_GRID_COLS, DEFAULT_COLS)
+                    .putInt(KEY_GRID_ROWS, DEFAULT_ROWS)
+                    .putFloat(KEY_GRID_X0, DEFAULT_X0)
+                    .putFloat(KEY_GRID_Y0, DEFAULT_Y0)
+                    .putFloat(KEY_CELL_WIDTH, DEFAULT_CELL_WIDTH)
+                    .putFloat(KEY_CELL_HEIGHT, DEFAULT_CELL_HEIGHT)
+                    .putFloat(KEY_GAP_X, DEFAULT_GAP_X)
+                    .putFloat(KEY_GAP_Y, DEFAULT_GAP_Y)
+                    .putFloat(KEY_GLASS_OPACITY, DEFAULT_GLASS_OPACITY)
+                    .putInt(KEY_GRID_PRESET_REV, GRID_PRESET_REV)
+                    .apply();
+            return;
+        }
+
         SharedPreferences.Editor e = prefs.edit();
         boolean changed = false;
 

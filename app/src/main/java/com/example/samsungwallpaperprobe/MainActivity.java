@@ -78,12 +78,12 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView title = text("Iridescent Wallpaper Lab v0.9", 25f, Color.BLACK, true);
+        TextView title = text("Iridescent Wallpaper Lab v0.11", 25f, Color.BLACK, true);
         title.setGravity(Gravity.CENTER);
         root.addView(title, matchWrap());
 
         TextView body = text(
-                "v0.9: во время касания стекло следует за пальцем напрямую 1:1 — без рваных accessibility-сэмплов. Служба One UI больше не двигает видимое стекло ступеньками: она только даёт реальные цели и подтверждает конечную страницу, а GPU плавно интерполирует движение между редкими событиями.",
+                "v0.11: движение стекла теперь повторяет модель Samsung PagedView: сначала учитывается системный touch slop, затем стекло следует за реальным движением пальца с компенсацией задержки WallpaperService. После отпускания используется quintic-анимация Samsung/Launcher3, а служба One UI только проверяет конечную страницу.",
                 16f, Color.DKGRAY, false);
         body.setGravity(Gravity.CENTER);
         body.setPadding(0, dp(14), 0, dp(20));
@@ -152,7 +152,7 @@ public class MainActivity extends Activity {
         root.addView(wallpaper, matchWrap());
 
         TextView note = text(
-                "Если One UI отдаёт только редкие scroll-события или номер конечной страницы, идеально получить его внутренний frame-by-frame offset публичным API всё ещё нельзя. Поэтому v0.9 использует гибрид: touch 1:1 пока палец на экране, а после отпускания — подтверждённая One UI цель с плавной 60 fps доводкой. Стекло больше не прячется во время ожидания.",
+                "Samsung One UI не отдаёт WallpaperService настоящий page offset. Поэтому v0.11 больше не пытается рисовать редкие accessibility-сэмплы как кадры: во время пальца мы имитируем собственный Samsung PagedView, а после отпускания повторяем его quintic snap. Accessibility остаётся только каналом проверки конечной страницы. Отладку можно включать/выключать как раньше.",
                 14f, Color.DKGRAY, false);
         note.setGravity(Gravity.CENTER);
         note.setPadding(0, dp(18), 0, 0);

@@ -1,21 +1,45 @@
-# Iridescent Wallpaper v0.10 — debounced One UI page authority
+# Iridescent Wallpaper v0.11 — Samsung PagedView physics
 
-v0.10 fixes two behaviors reported in v0.9:
+## Что исправлено
 
-1. A tiny, slow partial drag must not change the logical page just because One UI emits one early accessibility `toIndex` event.
-2. The first frame after finger release must not visibly pause while waiting for accessibility confirmation.
+### Точная сетка из калибровочного скриншота
+При первом запуске v0.11 геометрия принудительно (один раз) переводится на значения пользователя для скриншота 709×1536:
 
-## What changed
+- 4 × 6
+- Сетка X: 164 px
+- Сетка Y: 256 px
+- Ширина ячейки: 175 px
+- Высота ячейки: 176 px
+- Зазор X: 75 px
+- Зазор Y: 117 px
+- Стекло: 36%
 
-- Glass still follows the finger 1:1 while touching.
-- On release, the renderer immediately chooses a **visual-only** provisional target so animation keeps moving; it does **not** save that page.
-- Short + slow releases predict a return to the current page.
-- Strong releases may visually continue toward the neighbour, but One UI accessibility remains the only authority that can persist a new page while the service is enabled.
-- Accessibility page-index events are now debounced. One early `toIndex` packet is only a candidate.
-- A page change is committed only when supported by settled continuous scroll data, or by a strong release plus a stable/aged candidate.
-- A weak release that receives a contradictory next-page index is rejected and eased back.
-- Page-change spring constants were retuned to reduce the small hitch/jolt when the target changes.
-- Debug overlay shows `cand=<page> x<hits>` so false early page events are visible.
+Старые версии уже сохраняли геометрию в SharedPreferences, поэтому простая смена DEFAULT-констант не меняла существующую установку. v0.11 имеет отдельную ревизию пресета и один раз перезаписывает только геометрию. Назначения приложений по ячейкам не удаляются.
 
-Grid defaults remain the user's calibrated 4×6 values from v0.9:
-X 164 px, Y 256 px, cell 175×176 px, gap 75×117 px, glass 36% on a 709×1536 reference screen.
+### Синхронизация движения
+Исследование исходников Samsung Launcher показало, что его Workspace построен поверх PagedView. В v0.11 модель движения приближена именно к Samsung PagedView:
+
+- используется обычный Android `getScaledTouchSlop()`;
+- до прохождения touch slop стекло не двигается — как и страница лаунчера;
+- после начала скролла первый участок до touch slop не включается в перевод страницы;
+- для компенсации задержки WallpaperService используется свежая кадровая скорость пальца, которая сразу меняет знак при развороте;
+- решение о переходе использует пороги PagedView (значимое движение 40%, возврат при обратном fling после 33%, fling threshold 500 dp/s, min snap 1500 dp/s);
+- после отпускания используется quintic ease-out `(t-1)^5 + 1`, как в Samsung PagedView;
+- accessibility не используется для покадрового движения и не может создавать ступеньки — она только проверяет конечную страницу.
+
+## Отладка
+Переключатель отладки сохранён. Плашка показывает FPS, источник позиции, BG/GLASS, A11Y и теперь также:
+
+- `lag Nms` — измеренная задержка события касания;
+- `slop Npx` — системный touch slop, который имитируется перед началом движения.
+
+## Что проверить
+1. Очень медленно сдвинуть страницу на несколько пикселей — стекло не должно начинать ехать раньше иконок.
+2. Медленно вести страницу дальше — стекло должно держаться ближе к иконкам.
+3. Вести в одну сторону и, не отпуская, резко вернуть палец — компенсация не должна продолжать тянуть стекло в старом направлении.
+4. Сделать короткий медленный свайп и отпустить — страница должна вернуться.
+5. Сделать обычный быстрый переход — после отпускания должна идти плавная quintic-анимация без редких A11Y-ступенек.
+
+Если даже после этого останется постоянная фазовая ошибка, следующий эксперимент — не угадывать offset вообще, а через AccessibilityNodeInfo отслеживать `boundsInScreen` реального значка One UI и вычислять фактическое смещение страницы по координате самого view. Это потребует более широкого accessibility-доступа и пока не гарантировано Samsung.
+
+- Fling дополнительно требует более 25 px суммарного движения, как в архивном Samsung `PagedView`.
