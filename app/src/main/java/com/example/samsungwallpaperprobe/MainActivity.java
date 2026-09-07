@@ -25,6 +25,7 @@ public class MainActivity extends Activity {
     private TextView pagesValue;
     private TextView currentValue;
     private Button debugButton;
+    private Button outlinesButton;
     private TextView trackerStatus;
 
     @Override
@@ -49,6 +50,7 @@ public class MainActivity extends Activity {
         if (!prefs.contains(Prefs.KEY_PAGE_COUNT)) e.putInt(Prefs.KEY_PAGE_COUNT, 4);
         if (!prefs.contains(Prefs.KEY_SAVED_PAGE)) e.putInt(Prefs.KEY_SAVED_PAGE, 0);
         if (!prefs.contains(Prefs.KEY_SHOW_DEBUG)) e.putBoolean(Prefs.KEY_SHOW_DEBUG, false);
+        if (!prefs.contains(Prefs.KEY_SHOW_ICON_OUTLINES)) e.putBoolean(Prefs.KEY_SHOW_ICON_OUTLINES, true);
         if (!prefs.contains(Prefs.KEY_GRID_COLS)) e.putInt(Prefs.KEY_GRID_COLS, Prefs.DEFAULT_COLS);
         if (!prefs.contains(Prefs.KEY_GRID_ROWS)) e.putInt(Prefs.KEY_GRID_ROWS, Prefs.DEFAULT_ROWS);
         if (!prefs.contains(Prefs.KEY_GRID_X0)) e.putFloat(Prefs.KEY_GRID_X0, Prefs.DEFAULT_X0);
@@ -74,13 +76,13 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView title = text("Iridescent Bounds Engine v0.17", 25f, Color.BLACK, true);
+        TextView title = text("Iridescent Bounds Engine v0.18", 25f, Color.BLACK, true);
         title.setGravity(Gravity.CENTER);
         root.addView(title, matchWrap());
 
         TextView body = text(
-                "Старый виртуальный offset, touch-slop, предсказание fling и наши пружины удалены. " +
-                "Теперь движок смотрит на реальные bounds одной иконки One UI. Раскладка приложений кэшируется при выходе на рабочий стол, а в движении обновляется только один anchor-node.",
+                "v0.18 кэширует реальные bounds всех найденных иконок при выходе на Home, а во время свайпа обновляет только один anchor-node. " +
+                "Сетка оставлена для старого стекла, но bounds-трекер от неё больше не зависит. Высокочастотные touch-события используются только как интерполяция между редкими реальными bounds — они не решают, какая страница выбрана.",
                 16f, Color.DKGRAY, false);
         body.setGravity(Gravity.CENTER);
         body.setPadding(0, dp(14), 0, dp(18));
@@ -129,6 +131,10 @@ public class MainActivity extends Activity {
         debugButton.setOnClickListener(v -> toggleDebug());
         root.addView(debugButton, matchWrap());
 
+        outlinesButton = new Button(this);
+        outlinesButton.setOnClickListener(v -> toggleOutlines());
+        root.addView(outlinesButton, matchWrap());
+
         Button wallpaper = new Button(this);
         wallpaper.setText("ВЫБРАТЬ / ОБНОВИТЬ ЖИВЫЕ ОБОИ");
         wallpaper.setOnClickListener(v -> {
@@ -138,7 +144,7 @@ public class MainActivity extends Activity {
         root.addView(wallpaper, matchWrap());
 
         TextView note = text(
-                "120 FPS здесь означает рендер-цикл до 120 кадров/с. Источник bounds опрашивает только одну закэшированную иконку примерно 125 раз/с; весь accessibility-tree сканируется только при выходе на Home, смене сетки или когда anchor ушёл со страницы. На странице со стеклом должен быть хотя бы один назначенный в редакторе app — из него движок сможет выбрать anchor.",
+                "Белая обводка всех найденных приложений работает независимо от режима отладки и независимо от сетки. Полный accessibility-tree сканируется при выходе на Home и при редкой смене anchor. В движении опрашивается только одна иконка. В отладке теперь отдельно видно POLL Hz и CHANGE Hz: если POLL ≈120, а CHANGE ≈20, значит ступенчатость идёт от частоты обновления bounds Samsung, а не от GPU.",
                 13.5f, Color.DKGRAY, false);
         note.setGravity(Gravity.CENTER);
         note.setPadding(0, dp(18), 0, 0);
@@ -201,6 +207,12 @@ public class MainActivity extends Activity {
         refreshValues();
     }
 
+    private void toggleOutlines() {
+        boolean current = prefs.getBoolean(Prefs.KEY_SHOW_ICON_OUTLINES, true);
+        prefs.edit().putBoolean(Prefs.KEY_SHOW_ICON_OUTLINES, !current).apply();
+        refreshValues();
+    }
+
     private void bumpGeneration() {
         int generation = prefs.getInt(Prefs.KEY_CONFIG_GENERATION, 0);
         prefs.edit().putInt(Prefs.KEY_CONFIG_GENERATION, generation + 1).apply();
@@ -218,6 +230,8 @@ public class MainActivity extends Activity {
         currentValue.setText((page + 1) + " / " + count);
         boolean debug = prefs.getBoolean(Prefs.KEY_SHOW_DEBUG, false);
         debugButton.setText(debug ? "ОТЛАДКА: ВКЛ" : "ОТЛАДКА: ВЫКЛ");
+        boolean outlines = prefs.getBoolean(Prefs.KEY_SHOW_ICON_OUTLINES, true);
+        if (outlinesButton != null) outlinesButton.setText(outlines ? "ОБВОДКА ВСЕХ ИКОНОК: ВКЛ" : "ОБВОДКА ВСЕХ ИКОНОК: ВЫКЛ");
 
         boolean enabled = isAccessibilityEnabled();
         if (!enabled) {
@@ -226,16 +240,16 @@ public class MainActivity extends Activity {
         } else if (LauncherScrollBus.positionValid) {
             long age = Math.max(0L, android.os.SystemClock.uptimeMillis() - LauncherScrollBus.positionUptimeMs);
             trackerStatus.setText(String.format(Locale.US,
-                    "BOUND OK: %s · page %d · %.1f Hz · age %d ms · snapshot %d/%d",
+                    "BOUND OK: %s · page %d · poll %.1f Hz · real changes %.1f Hz · age %d ms · icons %d",
                     LauncherScrollBus.anchorLabel,
-                    LauncherScrollBus.anchorPage + 1,
-                    LauncherScrollBus.trackerHz,
+                    LauncherScrollBus.authoritativePage < 0 ? 0 : LauncherScrollBus.authoritativePage + 1,
+                    LauncherScrollBus.trackerPollHz,
+                    LauncherScrollBus.boundsChangeHz,
                     age,
-                    LauncherScrollBus.visibleSlotsInSnapshot,
-                    LauncherScrollBus.configuredSlots));
+                    LauncherScrollBus.iconSnapshot.length));
             trackerStatus.setTextColor(Color.rgb(20, 125, 65));
         } else {
-            trackerStatus.setText("Служба включена. Вернись на Home — движок сам выберет anchor из назначенных приложений.");
+            trackerStatus.setText("Служба включена. Вернись на Home — движок просканирует иконки и сам выберет anchor.");
             trackerStatus.setTextColor(Color.DKGRAY);
         }
     }

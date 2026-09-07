@@ -1,35 +1,26 @@
-# Iridescent Wallpaper v0.17 — Bounds Engine 120
+# Iridescent Wallpaper v0.18 — cached icon layout + bounds resampling
 
-This version replaces the old virtual page-offset stack with direct icon-bounds tracking.
+This build keeps the old grid/editor but the bounds tracker no longer depends on it.
 
-## Architecture
+## What changed
 
-- `WallpaperService` no longer receives touch events.
-- No touch-slop emulation, predicted fling, page spring, quintic snap, A11Y page debounce, or virtual offset is used for animation.
-- When One UI Home becomes visible, the accessibility service performs one tree scan and matches only apps assigned in the glass-grid editor.
-- It caches their relative grid layout and chooses one visible configured app as an anchor.
-- During motion, only that one cached `AccessibilityNodeInfo` is refreshed at ~125 Hz.
-- Continuous page position is derived from the anchor's real `getBoundsInScreen()` X coordinate:
+- On each return to One UI Home, Accessibility scans the launcher tree once and caches all app-like icon bounds it can see.
+- During motion only ONE cached AccessibilityNodeInfo is refreshed as the anchor.
+- All cached icons are stored in world coordinates relative to the real page position.
+- A white rounded outline is drawn around every cached icon even when normal debug is OFF. This can be toggled independently in the app.
+- The debug panel now reports both POLL Hz and CHANGE Hz. POLL is how often we call refresh(); CHANGE is how often Samsung actually publishes a different bounds coordinate.
+- Wallpaper touch events are re-enabled only as a temporal bridge between real bounds samples while the finger is down. Touch never chooses a page and no virtual fling/spring model was reintroduced.
+- After finger release, the renderer makes only a very short, bounded velocity extrapolation (<=42 ms, <=0.085 page) between real bounds samples to reduce 15–30 Hz stair-stepping.
+- Existing glass grid, grid editor, app assignments and geometry are preserved and not migrated/reset.
 
-  `position = anchorPage - (currentX - restingX) / screenWidth`
+## Why
 
-- When the anchor leaves the page, a rare new tree scan chooses an icon on the incoming page by continuity.
-- The OpenGL wallpaper loop targets 120 FPS. Actual measured FPS can still be capped by the device / One UI wallpaper surface refresh rate.
-- All configured glass pages are rendered continuously, so pads do not disappear just because a logical page changed.
-
-## Cached-relative-layout model
-
-The user's suggestion is implemented: the app does **not** query every icon at frame rate. On each Home entry it snapshots the configured visible apps, measures a global X/Y bias between the editor grid and One UI's real icon bounds, then tracks one anchor only. The snapshot is refreshed on Home entry, grid changes, or anchor reacquisition.
-
-## Grid
-
-GridEditorActivity and existing geometry/preferences are intentionally unchanged from the v0.8-compatible branch. Existing app-to-cell assignments are preserved.
+v0.17 could poll the anchor around 120 Hz while the actual bounds coordinate changed only around ~20 Hz on some One UI builds. Rendering 120 GPU frames from a 20 Hz position source still looks like 20 FPS. v0.18 separates these rates in diagnostics and resamples the real bounds source instead of increasing tree scans.
 
 ## Test
 
-1. Install over the previous build.
-2. In Android accessibility settings, make sure **One UI Bounds Engine** is enabled. If Android disabled it after the service metadata changed, toggle it off/on once.
-3. Turn debug on.
-4. Return to Home and wait a moment for `BOUNDS REAL`.
-5. Test slow drag, reverse drag without release, incomplete swipe spring-back, and a full page transition.
-6. Debug should show renderer FPS, tracker Hz, anchor app/page, current X/rest X/dX, snapshot size, scan count and reacquisition count.
+1. Re-enable **One UI Bounds Engine** in Accessibility after installing the APK.
+2. Return to Home. White outlines should appear around detected launcher icons even with debug OFF.
+3. Swipe slowly, reverse direction, and complete a page transition.
+4. Turn debug ON and compare `POLL` vs `CHANGE`.
+5. Note whether the outlines follow the real icons smoothly under the finger and during Samsung's post-release animation.

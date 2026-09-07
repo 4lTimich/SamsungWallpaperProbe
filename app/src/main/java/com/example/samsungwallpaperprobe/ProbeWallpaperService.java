@@ -17,6 +17,7 @@ import android.opengl.GLUtils;
 import android.os.SystemClock;
 import android.service.wallpaper.WallpaperService;
 import android.view.SurfaceHolder;
+import android.view.MotionEvent;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -26,11 +27,12 @@ import java.util.Locale;
 import java.util.concurrent.locks.LockSupport;
 
 /**
- * v0.17: bounds-only engine.
+ * v0.18: cached-layout bounds engine.
  *
- * All old virtual-offset / touch-slop / predicted-fling / custom-spring code is removed.
- * The wallpaper renders one continuous position published by LauncherAccessibilityService,
- * which is derived from the real getBoundsInScreen() X coordinate of one launcher icon.
+ * The real One UI icon bounds remain authoritative. Touch is re-enabled only as a high-rate
+ * temporal bridge between real bounds samples; it never selects a page and never runs a virtual
+ * fling/spring. The accessibility service also publishes a cached layout of all app-like nodes,
+ * which can be outlined independently of the old glass grid.
  */
 public class ProbeWallpaperService extends WallpaperService {
 
@@ -51,6 +53,7 @@ public class ProbeWallpaperService extends WallpaperService {
         private int pageCount = 4;
         private int lastConfigGeneration = -1;
         private boolean showDebug = false;
+        private boolean showIconOutlines = true;
         private float displayPosition = 0f;
         private float motionEnergy = 0f;
         private String source = "BOUNDS WAIT";
@@ -92,13 +95,17 @@ public class ProbeWallpaperService extends WallpaperService {
                     if (Prefs.KEY_SHOW_DEBUG.equals(key)) {
                         showDebug = sharedPreferences.getBoolean(Prefs.KEY_SHOW_DEBUG, showDebug);
                     }
+                    if (Prefs.KEY_SHOW_ICON_OUTLINES.equals(key)) {
+                        showIconOutlines = sharedPreferences.getBoolean(Prefs.KEY_SHOW_ICON_OUTLINES, true);
+                    }
                 };
 
         @Override
         public void onCreate(SurfaceHolder holder) {
             super.onCreate(holder);
-            // Bounds tracking is authoritative now. We deliberately do not request touch events.
-            setTouchEventsEnabled(false);
+            // Bounds remains authoritative. Touch only fills the milliseconds between two real
+            // bounds samples and never decides page state.
+            setTouchEventsEnabled(true);
             setOffsetNotificationsEnabled(false);
             prefs = getSharedPreferences(Prefs.PREFS, Context.MODE_PRIVATE);
             Prefs.ensureV06GridDefaults(prefs,
@@ -112,6 +119,7 @@ public class ProbeWallpaperService extends WallpaperService {
             synchronized (stateLock) {
                 pageCount = clampInt(prefs.getInt(Prefs.KEY_PAGE_COUNT, 4), 2, 9);
                 showDebug = prefs.getBoolean(Prefs.KEY_SHOW_DEBUG, false);
+                showIconOutlines = prefs.getBoolean(Prefs.KEY_SHOW_ICON_OUTLINES, true);
                 int generation = prefs.getInt(Prefs.KEY_CONFIG_GENERATION, 0);
                 if (forcePosition || generation != lastConfigGeneration) {
                     int saved = clampInt(prefs.getInt(Prefs.KEY_SAVED_PAGE, 0), 0, pageCount - 1);
@@ -119,6 +127,21 @@ public class ProbeWallpaperService extends WallpaperService {
                 }
                 lastConfigGeneration = generation;
                 gridDirty = true;
+            }
+        }
+
+        @Override
+        public void onTouchEvent(MotionEvent event) {
+            super.onTouchEvent(event);
+            if (event == null) return;
+            int action = event.getActionMasked();
+            LauncherScrollBus.touchX = event.getX();
+            LauncherScrollBus.touchUptimeMs = SystemClock.uptimeMillis();
+            LauncherScrollBus.touchSequence++;
+            if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_MOVE) {
+                LauncherScrollBus.touchActive = true;
+            } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                LauncherScrollBus.touchActive = false;
             }
         }
 
@@ -178,15 +201,48 @@ public class ProbeWallpaperService extends WallpaperService {
         private void consumeBoundsPosition(float dt) {
             synchronized (stateLock) {
                 long now = SystemClock.uptimeMillis();
+                int w = Math.max(1, surfaceW);
+
                 if (LauncherScrollBus.serviceConnected
                         && LauncherScrollBus.positionValid
-                        && now - LauncherScrollBus.positionUptimeMs < 100L) {
-                    // Direct real coordinate. No homemade easing and no touch prediction.
-                    displayPosition = LauncherScrollBus.position;
-                    source = "BOUNDS REAL";
+                        && now - LauncherScrollBus.positionUptimeMs < 140L) {
+
+                    float realPos = LauncherScrollBus.position;
+
+                    // While the finger is down, bridge between two REAL bounds samples using
+                    // the finger displacement since the exact touch X captured with the last
+                    // changed bounds sample. This does not predict touch-slop or page choice.
+                    if (LauncherScrollBus.touchActive
+                            && LauncherScrollBus.touchWasActiveAtLastBoundsChange
+                            && LauncherScrollBus.lastChangedUptimeMs > 0L
+                            && now - LauncherScrollBus.lastChangedUptimeMs < 90L) {
+                        float touchDx = LauncherScrollBus.touchX - LauncherScrollBus.touchXAtLastBoundsChange;
+                        displayPosition = LauncherScrollBus.lastChangedPosition - touchDx / w;
+                        source = "BOUNDS + TOUCH BRIDGE";
+                    } else if (!LauncherScrollBus.touchActive
+                            && LauncherScrollBus.lastChangedUptimeMs > 0L) {
+                        // Samsung often exposes changed bounds at ~15-30 Hz even if refresh() is
+                        // called >100 Hz. Predict only a very short distance from the last real
+                        // sample so the 120-Hz renderer does not visually stair-step. Every real
+                        // sample immediately corrects this prediction.
+                        long ageMs = Math.max(0L, now - LauncherScrollBus.lastChangedUptimeMs);
+                        float v = LauncherScrollBus.velocityPagesPerSec;
+                        if (ageMs <= 42L && Math.abs(v) > 0.015f) {
+                            float t = ageMs / 1000f;
+                            float predicted = LauncherScrollBus.lastChangedPosition + v * t;
+                            // Keep prediction tightly bounded to avoid inventing a page.
+                            float maxLead = 0.085f;
+                            displayPosition = clamp(predicted, realPos - maxLead, realPos + maxLead);
+                            source = "BOUNDS RESAMPLED";
+                        } else {
+                            displayPosition = realPos;
+                            source = "BOUNDS REAL";
+                        }
+                    } else {
+                        displayPosition = realPos;
+                        source = "BOUNDS REAL";
+                    }
                 } else if (LauncherScrollBus.authoritativePage >= 0) {
-                    // If the anchor is being reacquired, hold the last known settled page instead
-                    // of inventing a transition.
                     if (!LauncherScrollBus.positionValid) {
                         displayPosition = LauncherScrollBus.authoritativePage;
                     }
@@ -243,7 +299,7 @@ public class ProbeWallpaperService extends WallpaperService {
             private EGLContext eglContext = EGL14.EGL_NO_CONTEXT;
             private EGLSurface eglSurface = EGL14.EGL_NO_SURFACE;
 
-            private int bgProgram, glassProgram, texProgram;
+            private int bgProgram, glassProgram, outlineProgram, texProgram;
             private FloatBuffer quad;
             private int debugTexture = 0;
             private Bitmap debugBitmap;
@@ -345,6 +401,7 @@ public class ProbeWallpaperService extends WallpaperService {
 
                 bgProgram = buildProgram(VS_BG, FS_BG);
                 glassProgram = buildProgram(VS_GLASS, FS_GLASS);
+                outlineProgram = buildProgram(VS_GLASS, FS_OUTLINE);
                 texProgram = buildProgram(VS_TEX, FS_TEX);
 
                 int[] tex = new int[1];
@@ -373,7 +430,7 @@ public class ProbeWallpaperService extends WallpaperService {
                 float pos, energy, opacity, x0, y0, cw, ch, gx, gy;
                 int pages;
                 ArrayList<Cell>[] pageCells;
-                boolean debug;
+                boolean debug, outlines;
                 synchronized (stateLock) {
                     pos = displayPosition;
                     energy = motionEnergy;
@@ -382,10 +439,12 @@ public class ProbeWallpaperService extends WallpaperService {
                     pages = pageCount;
                     pageCells = cellsByPage;
                     debug = showDebug;
+                    outlines = showIconOutlines;
                 }
 
                 drawBackground(w, h, nowNs / 1_000_000_000f, pos, energy);
                 if (pageCells != null) drawGlass(w, h, pos, pages, pageCells, x0, y0, cw, ch, gx, gy, opacity);
+                if (outlines) drawIconOutlines(w, h, pos);
                 if (debug && LauncherScrollBus.positionValid
                         && SystemClock.uptimeMillis() - LauncherScrollBus.positionUptimeMs < 120L) {
                     drawBoundsMarker(w, h);
@@ -426,6 +485,30 @@ public class ProbeWallpaperService extends WallpaperService {
                         GLES20.glUniform2f(uCenter, cx, cy);
                         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
                     }
+                }
+            }
+
+            private void drawIconOutlines(int w, int h, float pos) {
+                LauncherScrollBus.IconBox[] boxes = LauncherScrollBus.iconSnapshot;
+                if (boxes == null || boxes.length == 0) return;
+
+                GLES20.glUseProgram(outlineProgram);
+                bindQuad(outlineProgram, "aPos");
+                int uScreen = GLES20.glGetUniformLocation(outlineProgram, "uScreen");
+                int uCenter = GLES20.glGetUniformLocation(outlineProgram, "uCenter");
+                int uSize = GLES20.glGetUniformLocation(outlineProgram, "uSize");
+                GLES20.glUniform2f(uScreen, w, h);
+
+                for (LauncherScrollBus.IconBox box : boxes) {
+                    float cx = box.movesWithPages ? box.worldCenterX - pos * w : box.worldCenterX;
+                    float cy = box.centerY;
+                    float bw = Math.max(22f, box.width + 8f);
+                    float bh = Math.max(22f, box.height + 8f);
+                    if (cx + bw * 0.5f < -12f || cx - bw * 0.5f > w + 12f
+                            || cy + bh * 0.5f < -12f || cy - bh * 0.5f > h + 12f) continue;
+                    GLES20.glUniform2f(uCenter, cx, cy);
+                    GLES20.glUniform2f(uSize, bw, bh);
+                    GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
                 }
             }
 
@@ -475,28 +558,28 @@ public class ProbeWallpaperService extends WallpaperService {
                 debugPaint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
                 debugPaint.setTextSize(54f);
                 debugPaint.setColor(Color.WHITE);
-                debugCanvas.drawText("Bounds Engine v0.17", 38, 68, debugPaint);
+                debugCanvas.drawText("Bounds Engine v0.18", 38, 68, debugPaint);
                 debugPaint.setTypeface(android.graphics.Typeface.DEFAULT);
                 debugPaint.setTextSize(31f);
 
                 long age = Math.max(0L, SystemClock.uptimeMillis() - LauncherScrollBus.positionUptimeMs);
                 String l1, l2, l3, l4, l5, l6, l7;
                 synchronized (stateLock) {
-                    l1 = String.format(Locale.US, "FPS %.1f/120  TRACK %.1fHz  %s", measuredFps, LauncherScrollBus.trackerHz, source);
+                    l1 = String.format(Locale.US, "FPS %.1f/120  POLL %.1fHz  CHANGE %.1fHz",
+                            measuredFps, LauncherScrollBus.trackerPollHz, LauncherScrollBus.boundsChangeHz);
                     l2 = String.format(Locale.US, "POS %.4f  PAGE %d/%d  v=%.3f", displayPosition,
                             LauncherScrollBus.authoritativePage < 0 ? 0 : LauncherScrollBus.authoritativePage + 1,
                             pageCount, LauncherScrollBus.velocityPagesPerSec);
-                    l3 = String.format(Locale.US, "ANCHOR %s  p%d r%d c%d", trim(LauncherScrollBus.anchorLabel, 28),
-                            LauncherScrollBus.anchorPage + 1, LauncherScrollBus.anchorRow + 1, LauncherScrollBus.anchorCol + 1);
-                    l4 = String.format(Locale.US, "X %d  rest %.1f  dx %.1f  age %dms",
-                            LauncherScrollBus.anchorCenterX, LauncherScrollBus.anchorRestX,
-                            LauncherScrollBus.anchorCenterX - LauncherScrollBus.anchorRestX, age);
-                    l5 = String.format(Locale.US, "snapshot %d/%d  scans %d  reacq %d",
-                            LauncherScrollBus.visibleSlotsInSnapshot, LauncherScrollBus.configuredSlots,
-                            LauncherScrollBus.layoutScans, LauncherScrollBus.anchorReacquires);
-                    l6 = String.format(Locale.US, "bias %.1f, %.1f  samples %d  changes %d",
-                            LauncherScrollBus.layoutBiasX, LauncherScrollBus.layoutBiasY,
-                            LauncherScrollBus.boundsSamples, LauncherScrollBus.boundsChanges);
+                    l3 = String.format(Locale.US, "%s  ANCHOR %s", source, trim(LauncherScrollBus.anchorLabel, 28));
+                    l4 = String.format(Locale.US, "X %d  world %.1f  age %dms  touch=%s",
+                            LauncherScrollBus.anchorCenterX, LauncherScrollBus.anchorWorldX, age,
+                            LauncherScrollBus.touchActive ? "DOWN" : "UP");
+                    l5 = String.format(Locale.US, "icons %d  scans %d  reacq %d",
+                            LauncherScrollBus.iconSnapshot.length, LauncherScrollBus.layoutScans,
+                            LauncherScrollBus.anchorReacquires);
+                    l6 = String.format(Locale.US, "samples %d  real changes %d  snapshot v%d",
+                            LauncherScrollBus.boundsSamples, LauncherScrollBus.boundsChanges,
+                            LauncherScrollBus.iconSnapshotVersion);
                     l7 = trim("STATE " + LauncherScrollBus.trackerState, 70);
                 }
 
@@ -612,6 +695,14 @@ public class ProbeWallpaperService extends WallpaperService {
                 " float shine=smoothstep(-0.35,0.75,-vLocal.y+vLocal.x*0.18)*0.16;" +
                 " vec3 col=vec3(0.92,0.95,1.0)+shine; float a=inside*(0.045+uOpacity*0.10)+edge*(0.30+uOpacity*0.42)+inner*0.05;" +
                 " gl_FragColor=vec4(col,clamp(a,0.0,0.82)*inside); }";
+
+        private static final String FS_OUTLINE =
+                "precision mediump float; varying vec2 vLocal;" +
+                "float sdRoundBox(vec2 p, vec2 b, float r){ vec2 q=abs(p)-b+r; return min(max(q.x,q.y),0.0)+length(max(q,0.0))-r; }" +
+                "void main(){ float d=sdRoundBox(vLocal,vec2(1.0),0.28);" +
+                " float edge=1.0-smoothstep(0.012,0.055,abs(d));" +
+                " float inner=1.0-smoothstep(0.045,0.090,abs(d+0.055));" +
+                " float a=max(edge*0.88,inner*0.20); gl_FragColor=vec4(0.97,0.99,1.0,a); }";
 
         private static final String VS_TEX =
                 "attribute vec2 aPos; varying vec2 vUv; uniform vec2 uScreen; uniform vec2 uCenter; uniform vec2 uSize;" +

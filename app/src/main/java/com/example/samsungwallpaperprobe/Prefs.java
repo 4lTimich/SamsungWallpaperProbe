@@ -11,6 +11,7 @@ public final class Prefs {
     public static final String KEY_SAVED_PAGE = "saved_page";
     public static final String KEY_CONFIG_GENERATION = "config_generation";
     public static final String KEY_SHOW_DEBUG = "show_debug";
+    public static final String KEY_SHOW_ICON_OUTLINES = "show_icon_outlines";
 
     // v0.12 only: v0.11 overwrote the user's geometry with a bad preset.
     // Restore the exact v0.8 geometry once, then leave the grid alone forever.
