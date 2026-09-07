@@ -24,6 +24,11 @@ public final class LauncherScrollBus {
     public static volatile String className = "";
     public static volatile String summary = "";
 
+    // Last page confirmed by One UI accessibility data. Zero-based.
+    // Kept in-process so the grid editor can open directly on the real page.
+    public static volatile int authoritativePage = -1;
+    public static volatile long authoritativePageUptimeMs = 0L;
+
     public static void resetEventValues() {
         scrollX = -1;
         scrollY = -1;

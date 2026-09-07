@@ -21,6 +21,7 @@ import android.widget.LinearLayout;
 import android.widget.ListView;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -67,8 +68,13 @@ public class GridEditorActivity extends Activity implements GlassGridView.CellTa
         int sw = getResources().getDisplayMetrics().widthPixels;
         int sh = getResources().getDisplayMetrics().heightPixels;
         Prefs.ensureV06GridDefaults(prefs, sw, sh);
-        editorPage = clamp(prefs.getInt(Prefs.KEY_SAVED_PAGE, 0), 0,
-                prefs.getInt(Prefs.KEY_PAGE_COUNT, 4) - 1);
+        int pages = prefs.getInt(Prefs.KEY_PAGE_COUNT, 4);
+        int detected = LauncherScrollBus.authoritativePage;
+        if (LauncherScrollBus.serviceConnected && detected >= 0 && detected < pages) {
+            editorPage = detected;
+        } else {
+            editorPage = clamp(prefs.getInt(Prefs.KEY_SAVED_PAGE, 0), 0, pages - 1);
+        }
         buildUi();
     }
 
@@ -84,12 +90,12 @@ public class GridEditorActivity extends Activity implements GlassGridView.CellTa
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView title = text("Редактор сетки стекла v0.6", 24f, Color.BLACK, true);
+        TextView title = text("Редактор сетки стекла v0.8", 24f, Color.BLACK, true);
         title.setGravity(Gravity.CENTER);
         root.addView(title, matchWrap());
 
         TextView hint = text(
-                "Тап по ячейке → выбрать приложение. Размер ячейки и расстояние между ячейками теперь регулируются отдельно по X и Y. На скриншоте приложение повторно не рисуется — так проще попасть стеклом точно под реальную иконку.",
+                "Каждая страница хранит СВОИ ячейки. Сверху всегда крупно указано, какую страницу ты сейчас редактируешь. Кнопка ниже подхватывает последнюю страницу, подтверждённую службой One UI, чтобы стекло случайно не записалось на страницу 1 вместо 2.",
                 15f, Color.DKGRAY, false);
         hint.setGravity(Gravity.CENTER);
         hint.setPadding(0, dp(8), 0, dp(12));
@@ -97,8 +103,20 @@ public class GridEditorActivity extends Activity implements GlassGridView.CellTa
 
         pageValue = text("", 22f, Color.BLACK, true);
         pageValue.setGravity(Gravity.CENTER);
-        root.addView(labelledStepper("Страница", pageValue,
+        root.addView(labelledStepper("РЕДАКТИРУЕТСЯ СТРАНИЦА", pageValue,
                 v -> changePage(-1), v -> changePage(1)), matchWrap());
+
+        Button useDetectedPage = new Button(this);
+        useDetectedPage.setText("ВЗЯТЬ ТЕКУЩУЮ СТРАНИЦУ ИЗ ONE UI");
+        useDetectedPage.setOnClickListener(v -> useAuthoritativePage());
+        LinearLayout.LayoutParams detectedParams = matchWrap();
+        detectedParams.setMargins(0, dp(4), 0, dp(10));
+        root.addView(useDetectedPage, detectedParams);
+
+        Button movePrevPage = new Button(this);
+        movePrevPage.setText("ПЕРЕНЕСТИ ЯЧЕЙКИ С ПРЕДЫДУЩЕЙ СТРАНИЦЫ СЮДА");
+        movePrevPage.setOnClickListener(v -> movePreviousPageAssignments());
+        root.addView(movePrevPage, matchWrap());
 
         LinearLayout dims = new LinearLayout(this);
         dims.setOrientation(LinearLayout.HORIZONTAL);
@@ -326,6 +344,54 @@ public class GridEditorActivity extends Activity implements GlassGridView.CellTa
         }
     }
 
+    private void useAuthoritativePage() {
+        int pages = prefs.getInt(Prefs.KEY_PAGE_COUNT, 4);
+        int detected = LauncherScrollBus.authoritativePage;
+        if (LauncherScrollBus.serviceConnected && detected >= 0 && detected < pages) {
+            editorPage = detected;
+            gridView.setEditorPage(editorPage);
+            refreshValues();
+            Toast.makeText(this, "Редактируется страница " + (editorPage + 1), Toast.LENGTH_SHORT).show();
+        } else {
+            Toast.makeText(this, "One UI пока не подтвердил текущую страницу. Вернись домой, листни страницу и открой редактор снова.", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void movePreviousPageAssignments() {
+        if (editorPage <= 0) {
+            Toast.makeText(this, "У первой страницы нет предыдущей", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        final int sourcePage = editorPage - 1;
+        new AlertDialog.Builder(this)
+                .setTitle("Перенести страницу " + (sourcePage + 1) + " → " + (editorPage + 1) + "?")
+                .setMessage("Назначенные приложения будут перенесены в те же ячейки. Уже занятые ячейки текущей страницы не перезаписываются.")
+                .setNegativeButton("Отмена", null)
+                .setPositiveButton("Перенести", (d, which) -> {
+                    int cols = prefs.getInt(Prefs.KEY_GRID_COLS, Prefs.DEFAULT_COLS);
+                    int rows = prefs.getInt(Prefs.KEY_GRID_ROWS, Prefs.DEFAULT_ROWS);
+                    SharedPreferences.Editor edit = prefs.edit();
+                    int moved = 0;
+                    for (int row = 0; row < rows; row++) {
+                        for (int col = 0; col < cols; col++) {
+                            String srcKey = Prefs.cellKey(sourcePage, row, col);
+                            String dstKey = Prefs.cellKey(editorPage, row, col);
+                            String pkg = prefs.getString(srcKey, null);
+                            String dst = prefs.getString(dstKey, null);
+                            if (pkg != null && !pkg.isEmpty() && (dst == null || dst.isEmpty())) {
+                                edit.putString(dstKey, pkg);
+                                edit.remove(srcKey);
+                                moved++;
+                            }
+                        }
+                    }
+                    edit.apply();
+                    gridView.invalidateAssignments();
+                    Toast.makeText(this, "Перенесено ячеек: " + moved, Toast.LENGTH_SHORT).show();
+                })
+                .show();
+    }
+
     private void changePage(int delta) {
         int pages = prefs.getInt(Prefs.KEY_PAGE_COUNT, 4);
         editorPage = clamp(editorPage + delta, 0, pages - 1);
@@ -420,7 +486,7 @@ public class GridEditorActivity extends Activity implements GlassGridView.CellTa
         int sw = getResources().getDisplayMetrics().widthPixels;
         int sh = getResources().getDisplayMetrics().heightPixels;
 
-        pageValue.setText((editorPage + 1) + " / " + pages);
+        pageValue.setText("СТРАНИЦА " + (editorPage + 1) + " / " + pages);
         colsValue.setText(String.valueOf(cols));
         rowsValue.setText(String.valueOf(rows));
         xValue.setText(Math.round(x0 * sw) + " px");

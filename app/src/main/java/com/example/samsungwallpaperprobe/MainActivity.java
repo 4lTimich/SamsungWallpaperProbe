@@ -78,12 +78,12 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView title = text("Iridescent Wallpaper Lab v0.7", 25f, Color.BLACK, true);
+        TextView title = text("Iridescent Wallpaper Lab v0.8", 25f, Color.BLACK, true);
         title.setGravity(Gravity.CENTER);
         root.addView(title, matchWrap());
 
         TextView body = text(
-                "v0.7: фон и стекло переведены на GPU/OpenGL. Плюс появился экспериментальный способ читать РЕАЛЬНЫЙ скролл One UI через системную службу специальных возможностей — без угадывания виртуального offset. Если Samsung отдаёт scrollX, виртуальная модель вообще не используется.",
+                "v0.8: при включённой службе One UI виртуальная модель БОЛЬШЕ НЕ ИМЕЕТ ПРАВА решать, переключилась страница или нет. Во время пальца используется реальный scrollX/scrollDeltaX, если Samsung их отдаёт; иначе touch служит только временным превью. После отпускания итоговую страницу подтверждает One UI.",
                 16f, Color.DKGRAY, false);
         body.setGravity(Gravity.CENTER);
         body.setPadding(0, dp(14), 0, dp(20));
@@ -152,7 +152,7 @@ public class MainActivity extends Activity {
         root.addView(wallpaper, matchWrap());
 
         TextView note = text(
-                "Важно: приложение не двигает настоящие иконки One UI. Оно двигает и калибрует только стекло под ними. Во время свайпа стеклянная сетка движется 1:1 со страницами, а цветной материал под ней может реагировать сильнее.",
+                "Если One UI отдаёт только номер конечной страницы, но не покадровый scroll, идеально повторить фирменную анимацию Samsung публичными API нельзя. В этом случае v0.8 следует пальцу во время жеста, а на коротком промежутке после отпускания прячет стекло и возвращает его уже на подтверждённой странице — без ложного виртуального перелистывания.",
                 14f, Color.DKGRAY, false);
         note.setGravity(Gravity.CENTER);
         note.setPadding(0, dp(18), 0, 0);

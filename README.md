@@ -1,32 +1,34 @@
-# Iridescent Wallpaper Lab v0.7 — GPU + Real One UI Offset Probe
+# Iridescent Wallpaper v0.8 — Accessibility authority + delta tracking
 
-Две большие перемены:
+This build addresses four v0.7 issues.
 
-1. **Canvas-рендер живых обоев удалён.** Wallpaper теперь рисуется через EGL/OpenGL ES 2.0 на отдельном render thread. Фон — один fullscreen fragment shader, стекло — дешёвые GPU quads. Цель — нормальные 50–60 FPS вместо 5–15 FPS.
-2. **Экспериментальный реальный offset One UI.** В тот же APK добавлена opt-in AccessibilityService `One UI Offset Probe`, ограниченная пакетом `com.sec.android.app.launcher` и без `canRetrieveWindowContent`. Если One UI Home отправляет `TYPE_VIEW_SCROLLED` с нормальными `scrollX/maxScrollX`, wallpaper использует этот реальный скролл вместо виртуального угадывания по пальцу.
+## 1. No virtual page commit while accessibility is enabled
+When `One UI Offset Probe` is connected, raw touch is only a temporary visual preview. It can no longer decide that a page changed. The page is committed only by:
+- a plausible absolute One UI `scrollX/maxScrollX`, or
+- integrated One UI `scrollDeltaX` settling very close to a page, or
+- an authoritative One UI page-index scroll event.
 
-## Как включить real offset
+If the user drags forward, returns the finger, and releases without One UI confirming a new page, the wallpaper returns to the already-known page instead of inventing a transition.
 
-После установки v0.7 открой приложение → нажми `ВКЛЮЧИТЬ РЕАЛЬНЫЙ OFFSET ONE UI` → в системном списке специальных возможностей включи `One UI Offset Probe` → вернись на рабочий стол.
+## 2. Better continuous movement
+v0.8 now uses `AccessibilityEvent.getScrollDeltaX()` when absolute `scrollX` is unavailable. This is the launcher's own scrolling delta, so reversals and post-release movement can track much closer than the old finger-distance heuristic.
 
-У приложения нет INTERNET permission. XML службы фильтрует accessibility-события только на `com.sec.android.app.launcher`; содержимое окон не запрашивается.
+If One UI exposes neither useful absolute scroll nor useful deltas, v0.8 enters a safe hybrid mode: touch previews the drag, then glass briefly fades during the uncertain post-release animation and reappears on the page confirmed by One UI. This avoids visibly sliding glass to the wrong place.
 
-## Что смотреть в отладке
+## 3. Page-specific grid editing made explicit
+The grid editor opens on the last page confirmed by One UI when available. It now has a prominent `РЕДАКТИРУЕТСЯ СТРАНИЦА` control and a button `ВЗЯТЬ ТЕКУЩУЮ СТРАНИЦУ ИЗ ONE UI`.
+Assignments remain stored separately per page.
 
-Включи `ОТЛАДКА` в приложении. На wallpaper появятся строки:
+## 4. Debug overlay orientation fixed
+The OpenGL debug texture no longer applies the extra vertical flip from v0.7.
 
-- `FPS` — фактическая частота GPU-рендера;
-- `SOURCE A11Y REAL` — One UI реально отдаёт абсолютный `scrollX/maxScrollX`; это лучший исход;
-- `SOURCE A11Y PAGE` — One UI отдаёт только индекс страницы; этого хватает хотя бы для точной фиксации результата свайпа;
-- `SOURCE TOUCH` — accessibility не дала пригодного offset, используется старый fallback;
-- `A11Y x=... max=... dx=...` — сырые поля One UI для диагностики;
-- `idx from>to count` — индексы из AccessibilityEvent;
-- класс события и короткое системное описание.
+## Debug sources
+- `A11Y REAL` — absolute One UI scroll position is available.
+- `A11Y DELTA` — One UI scroll deltas are being integrated.
+- `A11Y PAGE` — final page came from One UI.
+- `A11Y WAIT` — waiting for One UI; no virtual guess is allowed.
+- `A11Y HOLD` — no page change was confirmed; return to the known page.
+- `VIRTUAL TOUCH` — accessibility service is off, so legacy fallback is active.
 
-## Важный тест
-
-Сделай медленный свайп вперёд, не отпуская палец верни его назад и отпусти. Если `SOURCE A11Y REAL`, стекло должно повторить реальную страницу и вернуться вместе с One UI, а не самостоятельно «решить», что переход состоялся.
-
-Если `A11Y REAL` не появится, пришли скрин отладки после нескольких свайпов. По `x/max/dx/from/to/count/class` будет понятно, можно ли извлечь реальную страницу из другого accessibility-поля.
-
-Редактор сетки/ячеек и назначения приложений из v0.6 сохранён.
+## Build
+The GitHub Actions artifact is `IridescentWallpaper-v0.8-APK`.
