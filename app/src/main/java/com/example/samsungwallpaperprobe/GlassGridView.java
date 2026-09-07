@@ -10,7 +10,6 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.LinearGradient;
 import android.graphics.Paint;
-import android.graphics.Path;
 import android.graphics.RectF;
 import android.graphics.Shader;
 import android.graphics.drawable.Drawable;
@@ -41,6 +40,9 @@ public class GlassGridView extends View {
     public GlassGridView(Context context) {
         super(context);
         prefs = context.getSharedPreferences(Prefs.PREFS, Context.MODE_PRIVATE);
+        int sw = context.getResources().getDisplayMetrics().widthPixels;
+        int sh = context.getResources().getDisplayMetrics().heightPixels;
+        Prefs.ensureV06GridDefaults(prefs, sw, sh);
         pm = context.getPackageManager();
         setBackgroundColor(Color.rgb(24, 28, 38));
         reloadScreenshot();
@@ -96,44 +98,66 @@ public class GlassGridView extends View {
         int rows = prefs.getInt(Prefs.KEY_GRID_ROWS, Prefs.DEFAULT_ROWS);
         float x0 = prefs.getFloat(Prefs.KEY_GRID_X0, Prefs.DEFAULT_X0);
         float y0 = prefs.getFloat(Prefs.KEY_GRID_Y0, Prefs.DEFAULT_Y0);
-        float sx = prefs.getFloat(Prefs.KEY_GRID_STEP_X, Prefs.DEFAULT_STEP_X);
-        float sy = prefs.getFloat(Prefs.KEY_GRID_STEP_Y, Prefs.DEFAULT_STEP_Y);
-        float glassSize = prefs.getFloat(Prefs.KEY_GLASS_SIZE, Prefs.DEFAULT_GLASS_SIZE);
+        float cellW = prefs.getFloat(Prefs.KEY_CELL_WIDTH, Prefs.DEFAULT_CELL_WIDTH);
+        float cellH = prefs.getFloat(Prefs.KEY_CELL_HEIGHT, Prefs.DEFAULT_CELL_HEIGHT);
+        float gapX = prefs.getFloat(Prefs.KEY_GAP_X, Prefs.DEFAULT_GAP_X);
+        float gapY = prefs.getFloat(Prefs.KEY_GAP_Y, Prefs.DEFAULT_GAP_Y);
         float opacity = prefs.getFloat(Prefs.KEY_GLASS_OPACITY, Prefs.DEFAULT_GLASS_OPACITY);
 
+        float stepX = cellW + gapX;
+        float stepY = cellH + gapY;
         float screenW = content.width();
         float screenH = content.height();
-        float size = glassSize * screenW;
+        float pxW = cellW * screenW;
+        float pxH = cellH * screenH;
 
         for (int row = 0; row < rows; row++) {
             for (int col = 0; col < cols; col++) {
-                float cx = content.left + (x0 + col * sx) * screenW;
-                float cy = content.top + (y0 + row * sy) * screenH;
+                float cx = content.left + (x0 + col * stepX) * screenW;
+                float cy = content.top + (y0 + row * stepY) * screenH;
 
                 String pkg = prefs.getString(Prefs.cellKey(editorPage, row, col), null);
                 boolean assigned = pkg != null && !pkg.isEmpty();
 
                 if (assigned) {
-                    drawGlass(canvas, cx, cy, size, opacity);
-                    drawApp(canvas, pkg, cx, cy, size * 0.58f);
+                    drawGlass(canvas, cx, cy, pxW, pxH, opacity);
+                    // With a screenshot loaded, drawing the app icon again makes calibration
+                    // look doubled and confusing. Only draw the app icon in the blank preview.
+                    if (screenshot == null) {
+                        drawApp(canvas, pkg, cx, cy, Math.min(pxW, pxH) * 0.58f);
+                    }
                 }
 
+                float radius = Math.min(pxW, pxH) * 0.24f;
+                RectF cell = new RectF(cx - pxW * 0.5f, cy - pxH * 0.5f,
+                        cx + pxW * 0.5f, cy + pxH * 0.5f);
                 paint.setStyle(Paint.Style.STROKE);
-                paint.setStrokeWidth(Math.max(1.5f, screenW * 0.003f));
+                paint.setStrokeWidth(Math.max(1.5f, screenW * 0.0026f));
                 paint.setColor(assigned
-                        ? Color.argb(235, 255, 255, 255)
+                        ? Color.argb(240, 255, 255, 255)
                         : Color.argb(120, 255, 255, 255));
-                RectF cell = new RectF(cx - size * 0.54f, cy - size * 0.54f,
-                        cx + size * 0.54f, cy + size * 0.54f);
-                canvas.drawRoundRect(cell, size * 0.18f, size * 0.18f, paint);
+                canvas.drawRoundRect(cell, radius, radius, paint);
                 paint.setStyle(Paint.Style.FILL);
 
-                paint.setTextAlign(Paint.Align.CENTER);
-                paint.setTextSize(Math.max(14f, screenW * 0.030f));
+                // Small coordinate badge inside the cell instead of text under the icon.
+                String coord = (row + 1) + "," + (col + 1);
+                float textSize = Math.max(10f, screenW * 0.020f);
+                paint.setTextSize(textSize);
                 paint.setFakeBoldText(true);
-                paint.setColor(Color.argb(230, 255, 255, 255));
-                String label = assigned ? shortLabel(pkg) : (row + 1) + "," + (col + 1);
-                canvas.drawText(label, cx, cy + size * 0.76f, paint);
+                paint.setTextAlign(Paint.Align.LEFT);
+                float badgePad = textSize * 0.35f;
+                float tw = paint.measureText(coord);
+                float bx = cell.left + badgePad;
+                float by = cell.top + textSize * 1.15f;
+                paint.setColor(Color.argb(155, 0, 0, 0));
+                canvas.drawRoundRect(new RectF(
+                        bx - badgePad * 0.5f,
+                        cell.top + badgePad * 0.35f,
+                        bx + tw + badgePad * 0.75f,
+                        by + badgePad * 0.45f),
+                        badgePad, badgePad, paint);
+                paint.setColor(Color.WHITE);
+                canvas.drawText(coord, bx, by, paint);
                 paint.setFakeBoldText(false);
             }
         }
@@ -165,15 +189,15 @@ public class GlassGridView extends View {
         }
     }
 
-    private void drawGlass(Canvas canvas, float cx, float cy, float size, float opacity) {
-        float half = size * 0.5f;
-        float radius = size * 0.25f;
-        RectF rect = new RectF(cx - half, cy - half, cx + half, cy + half);
+    private void drawGlass(Canvas canvas, float cx, float cy, float width, float height, float opacity) {
+        float radius = Math.min(width, height) * 0.25f;
+        RectF rect = new RectF(cx - width * 0.5f, cy - height * 0.5f,
+                cx + width * 0.5f, cy + height * 0.5f);
 
         paint.setStyle(Paint.Style.FILL);
         paint.setColor(Color.argb((int) (65 * opacity), 0, 0, 0));
-        canvas.drawRoundRect(new RectF(rect.left + size * 0.03f, rect.top + size * 0.045f,
-                rect.right + size * 0.03f, rect.bottom + size * 0.045f), radius, radius, paint);
+        canvas.drawRoundRect(new RectF(rect.left + width * 0.03f, rect.top + height * 0.045f,
+                rect.right + width * 0.03f, rect.bottom + height * 0.045f), radius, radius, paint);
 
         paint.setShader(new LinearGradient(
                 rect.left, rect.top, rect.right, rect.bottom,
@@ -187,15 +211,16 @@ public class GlassGridView extends View {
         canvas.drawRoundRect(rect, radius, radius, paint);
         paint.setShader(null);
 
+        float min = Math.min(width, height);
         paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeWidth(Math.max(2f, size * 0.045f));
+        paint.setStrokeWidth(Math.max(2f, min * 0.045f));
         paint.setColor(Color.argb((int) (205 * opacity), 255, 255, 255));
         canvas.drawRoundRect(rect, radius, radius, paint);
 
-        paint.setStrokeWidth(Math.max(1f, size * 0.018f));
+        paint.setStrokeWidth(Math.max(1f, min * 0.018f));
         paint.setColor(Color.argb((int) (110 * opacity), 42, 48, 58));
-        RectF inner = new RectF(rect.left + size * 0.055f, rect.top + size * 0.055f,
-                rect.right - size * 0.055f, rect.bottom - size * 0.055f);
+        RectF inner = new RectF(rect.left + min * 0.055f, rect.top + min * 0.055f,
+                rect.right - min * 0.055f, rect.bottom - min * 0.055f);
         canvas.drawRoundRect(inner, radius * 0.78f, radius * 0.78f, paint);
         paint.setStyle(Paint.Style.FILL);
     }
@@ -220,6 +245,7 @@ public class GlassGridView extends View {
         }
     }
 
+    @SuppressWarnings("unused")
     private String shortLabel(String packageName) {
         String cached = labelCache.get(packageName);
         if (cached != null) return cached;
@@ -230,12 +256,7 @@ public class GlassGridView extends View {
             labelCache.put(packageName, label);
             return label;
         } catch (Exception ignored) {
-            String label = packageName;
-            int dot = label.lastIndexOf('.');
-            if (dot >= 0 && dot < label.length() - 1) label = label.substring(dot + 1);
-            if (label.length() > 11) label = label.substring(0, 10) + "…";
-            labelCache.put(packageName, label);
-            return label;
+            return packageName;
         }
     }
 
@@ -258,22 +279,23 @@ public class GlassGridView extends View {
         int rows = prefs.getInt(Prefs.KEY_GRID_ROWS, Prefs.DEFAULT_ROWS);
         float x0 = prefs.getFloat(Prefs.KEY_GRID_X0, Prefs.DEFAULT_X0);
         float y0 = prefs.getFloat(Prefs.KEY_GRID_Y0, Prefs.DEFAULT_Y0);
-        float sx = prefs.getFloat(Prefs.KEY_GRID_STEP_X, Prefs.DEFAULT_STEP_X);
-        float sy = prefs.getFloat(Prefs.KEY_GRID_STEP_Y, Prefs.DEFAULT_STEP_Y);
-        float glassSize = prefs.getFloat(Prefs.KEY_GLASS_SIZE, Prefs.DEFAULT_GLASS_SIZE);
+        float cellW = prefs.getFloat(Prefs.KEY_CELL_WIDTH, Prefs.DEFAULT_CELL_WIDTH);
+        float cellH = prefs.getFloat(Prefs.KEY_CELL_HEIGHT, Prefs.DEFAULT_CELL_HEIGHT);
+        float stepX = cellW + prefs.getFloat(Prefs.KEY_GAP_X, Prefs.DEFAULT_GAP_X);
+        float stepY = cellH + prefs.getFloat(Prefs.KEY_GAP_Y, Prefs.DEFAULT_GAP_Y);
 
         float nx = (event.getX() - content.left) / content.width();
         float ny = (event.getY() - content.top) / content.height();
-        float halfX = Math.max(glassSize * 0.62f, sx * 0.42f);
-        float halfY = Math.max((glassSize * content.width() / content.height()) * 0.62f, sy * 0.42f);
+        float halfX = cellW * 0.58f;
+        float halfY = cellH * 0.58f;
 
         int bestRow = -1;
         int bestCol = -1;
         float bestDist = Float.MAX_VALUE;
         for (int row = 0; row < rows; row++) {
             for (int col = 0; col < cols; col++) {
-                float cx = x0 + col * sx;
-                float cy = y0 + row * sy;
+                float cx = x0 + col * stepX;
+                float cy = y0 + row * stepY;
                 if (Math.abs(nx - cx) <= halfX && Math.abs(ny - cy) <= halfY) {
                     float dx = nx - cx;
                     float dy = ny - cy;

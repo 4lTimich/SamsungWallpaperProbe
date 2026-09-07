@@ -39,9 +39,10 @@ public class GridEditorActivity extends Activity implements GlassGridView.CellTa
     private TextView rowsValue;
     private TextView xValue;
     private TextView yValue;
+    private TextView widthValue;
+    private TextView heightValue;
     private TextView gapXValue;
     private TextView gapYValue;
-    private TextView sizeValue;
     private TextView opacityValue;
     private int editorPage = 0;
 
@@ -63,6 +64,9 @@ public class GridEditorActivity extends Activity implements GlassGridView.CellTa
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences(Prefs.PREFS, MODE_PRIVATE);
+        int sw = getResources().getDisplayMetrics().widthPixels;
+        int sh = getResources().getDisplayMetrics().heightPixels;
+        Prefs.ensureV06GridDefaults(prefs, sw, sh);
         editorPage = clamp(prefs.getInt(Prefs.KEY_SAVED_PAGE, 0), 0,
                 prefs.getInt(Prefs.KEY_PAGE_COUNT, 4) - 1);
         buildUi();
@@ -80,12 +84,12 @@ public class GridEditorActivity extends Activity implements GlassGridView.CellTa
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView title = text("Редактор сетки стекла", 24f, Color.BLACK, true);
+        TextView title = text("Редактор сетки стекла v0.6", 24f, Color.BLACK, true);
         title.setGravity(Gravity.CENTER);
         root.addView(title, matchWrap());
 
         TextView hint = text(
-                "Тап по ячейке → выбрать приложение. Стекло на wallpaper появится только в занятых ячейках. Для точной подгонки можно загрузить скриншот и двигать сетку по 1 пикселю.",
+                "Тап по ячейке → выбрать приложение. Размер ячейки и расстояние между ячейками теперь регулируются отдельно по X и Y. На скриншоте приложение повторно не рисуется — так проще попасть стеклом точно под реальную иконку.",
                 15f, Color.DKGRAY, false);
         hint.setGravity(Gravity.CENTER);
         hint.setPadding(0, dp(8), 0, dp(12));
@@ -105,7 +109,8 @@ public class GridEditorActivity extends Activity implements GlassGridView.CellTa
         colsValue.setGravity(Gravity.CENTER);
         LinearLayout cols = labelledStepper("Колонки", colsValue,
                 v -> changeCols(-1), v -> changeCols(1));
-        LinearLayout.LayoutParams half = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        LinearLayout.LayoutParams half = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
         dims.addView(cols, half);
 
         rowsValue = text("", 20f, Color.BLACK, true);
@@ -141,16 +146,24 @@ public class GridEditorActivity extends Activity implements GlassGridView.CellTa
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(610));
         root.addView(gridView, previewParams);
 
-        TextView precision = text("Точная калибровка", 18f, Color.BLACK, true);
+        TextView precision = text("Точная калибровка", 19f, Color.BLACK, true);
         precision.setGravity(Gravity.CENTER);
         precision.setPadding(0, dp(14), 0, dp(6));
         root.addView(precision, matchWrap());
 
+        TextView geomHint = text(
+                "X/Y — центр первой ячейки. Ширина/высота — размер самого стекла. Зазор X/Y — пустое расстояние от края одной ячейки до края следующей.",
+                13.5f, Color.DKGRAY, false);
+        geomHint.setGravity(Gravity.CENTER);
+        geomHint.setPadding(0, 0, 0, dp(8));
+        root.addView(geomHint, matchWrap());
+
         xValue = text("", 16f, Color.BLACK, true);
         yValue = text("", 16f, Color.BLACK, true);
+        widthValue = text("", 16f, Color.BLACK, true);
+        heightValue = text("", 16f, Color.BLACK, true);
         gapXValue = text("", 16f, Color.BLACK, true);
         gapYValue = text("", 16f, Color.BLACK, true);
-        sizeValue = text("", 16f, Color.BLACK, true);
         opacityValue = text("", 16f, Color.BLACK, true);
 
         root.addView(fineRow("Сетка X", xValue,
@@ -159,21 +172,24 @@ public class GridEditorActivity extends Activity implements GlassGridView.CellTa
         root.addView(fineRow("Сетка Y", yValue,
                 v -> nudge(Prefs.KEY_GRID_Y0, -1, false),
                 v -> nudge(Prefs.KEY_GRID_Y0, 1, false)), matchWrap());
-        root.addView(fineRow("Шаг X", gapXValue,
-                v -> nudge(Prefs.KEY_GRID_STEP_X, -1, true),
-                v -> nudge(Prefs.KEY_GRID_STEP_X, 1, true)), matchWrap());
-        root.addView(fineRow("Шаг Y", gapYValue,
-                v -> nudge(Prefs.KEY_GRID_STEP_Y, -1, false),
-                v -> nudge(Prefs.KEY_GRID_STEP_Y, 1, false)), matchWrap());
-        root.addView(fineRow("Размер", sizeValue,
-                v -> nudge(Prefs.KEY_GLASS_SIZE, -1, true),
-                v -> nudge(Prefs.KEY_GLASS_SIZE, 1, true)), matchWrap());
+        root.addView(fineRow("Ширина ячейки", widthValue,
+                v -> nudge(Prefs.KEY_CELL_WIDTH, -1, true),
+                v -> nudge(Prefs.KEY_CELL_WIDTH, 1, true)), matchWrap());
+        root.addView(fineRow("Высота ячейки", heightValue,
+                v -> nudge(Prefs.KEY_CELL_HEIGHT, -1, false),
+                v -> nudge(Prefs.KEY_CELL_HEIGHT, 1, false)), matchWrap());
+        root.addView(fineRow("Зазор X", gapXValue,
+                v -> nudge(Prefs.KEY_GAP_X, -1, true),
+                v -> nudge(Prefs.KEY_GAP_X, 1, true)), matchWrap());
+        root.addView(fineRow("Зазор Y", gapYValue,
+                v -> nudge(Prefs.KEY_GAP_Y, -1, false),
+                v -> nudge(Prefs.KEY_GAP_Y, 1, false)), matchWrap());
         root.addView(fineRow("Стекло", opacityValue,
                 v -> changeOpacity(-0.05f),
                 v -> changeOpacity(0.05f)), matchWrap());
 
         Button reset = new Button(this);
-        reset.setText("СБРОСИТЬ СЕТКУ К 4×6 ИЗ ТВОЕГО СКРИНШОТА");
+        reset.setText("СБРОСИТЬ ГЕОМЕТРИЮ К 4×6");
         reset.setOnClickListener(v -> resetGridDefaults());
         LinearLayout.LayoutParams resetParams = matchWrap();
         resetParams.setMargins(0, dp(12), 0, dp(8));
@@ -188,7 +204,7 @@ public class GridEditorActivity extends Activity implements GlassGridView.CellTa
         root.addView(save, matchWrap());
 
         TextView bottom = text(
-                "Совет: сначала загрузить скриншот, подогнать центр первой ячейки и шаг между колонками/рядами, затем уже назначать приложения. Пустая ячейка = стекло не рисуется.",
+                "Для твоего скриншота: сначала попаданием первой ячейки выставь Сетка X/Y, потом ширину/высоту, и только после этого зазоры X/Y — они определяют накопление ошибки к 4-й колонке и нижним рядам.",
                 13.5f, Color.DKGRAY, false);
         bottom.setGravity(Gravity.CENTER);
         bottom.setPadding(0, dp(12), 0, 0);
@@ -241,14 +257,12 @@ public class GridEditorActivity extends Activity implements GlassGridView.CellTa
                 .create();
 
         final List<AppEntry> shown = new ArrayList<>(all);
-        final ArrayAdapter<String>[] adapterHolder = new ArrayAdapter[1];
 
         Runnable rebuild = () -> {
             List<String> display = new ArrayList<>();
             for (AppEntry e : shown) display.add(e.display());
             ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
                     android.R.layout.simple_list_item_1, display);
-            adapterHolder[0] = adapter;
             list.setAdapter(adapter);
         };
         rebuild.run();
@@ -338,17 +352,28 @@ public class GridEditorActivity extends Activity implements GlassGridView.CellTa
                 ? getResources().getDisplayMetrics().widthPixels
                 : getResources().getDisplayMetrics().heightPixels;
         float fallback;
-        if (Prefs.KEY_GRID_X0.equals(key)) fallback = Prefs.DEFAULT_X0;
-        else if (Prefs.KEY_GRID_Y0.equals(key)) fallback = Prefs.DEFAULT_Y0;
-        else if (Prefs.KEY_GRID_STEP_X.equals(key)) fallback = Prefs.DEFAULT_STEP_X;
-        else if (Prefs.KEY_GRID_STEP_Y.equals(key)) fallback = Prefs.DEFAULT_STEP_Y;
-        else fallback = Prefs.DEFAULT_GLASS_SIZE;
+        float min;
+        float max;
+
+        if (Prefs.KEY_GRID_X0.equals(key)) {
+            fallback = Prefs.DEFAULT_X0; min = 0f; max = 1f;
+        } else if (Prefs.KEY_GRID_Y0.equals(key)) {
+            fallback = Prefs.DEFAULT_Y0; min = 0f; max = 1f;
+        } else if (Prefs.KEY_CELL_WIDTH.equals(key)) {
+            fallback = Prefs.DEFAULT_CELL_WIDTH; min = 0.03f; max = 0.40f;
+        } else if (Prefs.KEY_CELL_HEIGHT.equals(key)) {
+            fallback = Prefs.DEFAULT_CELL_HEIGHT; min = 0.015f; max = 0.25f;
+        } else if (Prefs.KEY_GAP_X.equals(key)) {
+            fallback = Prefs.DEFAULT_GAP_X; min = 0f; max = 0.40f;
+        } else if (Prefs.KEY_GAP_Y.equals(key)) {
+            fallback = Prefs.DEFAULT_GAP_Y; min = 0f; max = 0.30f;
+        } else {
+            return;
+        }
 
         float current = prefs.getFloat(key, fallback);
         float next = current + pixels / (float) Math.max(1, basePixels);
-        if (Prefs.KEY_GLASS_SIZE.equals(key)) next = clamp(next, 0.06f, 0.28f);
-        else next = clamp(next, 0.01f, 0.95f);
-        prefs.edit().putFloat(key, next).apply();
+        prefs.edit().putFloat(key, clamp(next, min, max)).apply();
         gridView.invalidate();
         refreshValues();
     }
@@ -366,9 +391,10 @@ public class GridEditorActivity extends Activity implements GlassGridView.CellTa
                 .putInt(Prefs.KEY_GRID_ROWS, Prefs.DEFAULT_ROWS)
                 .putFloat(Prefs.KEY_GRID_X0, Prefs.DEFAULT_X0)
                 .putFloat(Prefs.KEY_GRID_Y0, Prefs.DEFAULT_Y0)
-                .putFloat(Prefs.KEY_GRID_STEP_X, Prefs.DEFAULT_STEP_X)
-                .putFloat(Prefs.KEY_GRID_STEP_Y, Prefs.DEFAULT_STEP_Y)
-                .putFloat(Prefs.KEY_GLASS_SIZE, Prefs.DEFAULT_GLASS_SIZE)
+                .putFloat(Prefs.KEY_CELL_WIDTH, Prefs.DEFAULT_CELL_WIDTH)
+                .putFloat(Prefs.KEY_CELL_HEIGHT, Prefs.DEFAULT_CELL_HEIGHT)
+                .putFloat(Prefs.KEY_GAP_X, Prefs.DEFAULT_GAP_X)
+                .putFloat(Prefs.KEY_GAP_Y, Prefs.DEFAULT_GAP_Y)
                 .putFloat(Prefs.KEY_GLASS_OPACITY, Prefs.DEFAULT_GLASS_OPACITY)
                 .apply();
         gridView.invalidateAssignments();
@@ -386,9 +412,10 @@ public class GridEditorActivity extends Activity implements GlassGridView.CellTa
         int rows = prefs.getInt(Prefs.KEY_GRID_ROWS, Prefs.DEFAULT_ROWS);
         float x0 = prefs.getFloat(Prefs.KEY_GRID_X0, Prefs.DEFAULT_X0);
         float y0 = prefs.getFloat(Prefs.KEY_GRID_Y0, Prefs.DEFAULT_Y0);
-        float sx = prefs.getFloat(Prefs.KEY_GRID_STEP_X, Prefs.DEFAULT_STEP_X);
-        float sy = prefs.getFloat(Prefs.KEY_GRID_STEP_Y, Prefs.DEFAULT_STEP_Y);
-        float size = prefs.getFloat(Prefs.KEY_GLASS_SIZE, Prefs.DEFAULT_GLASS_SIZE);
+        float width = prefs.getFloat(Prefs.KEY_CELL_WIDTH, Prefs.DEFAULT_CELL_WIDTH);
+        float height = prefs.getFloat(Prefs.KEY_CELL_HEIGHT, Prefs.DEFAULT_CELL_HEIGHT);
+        float gapX = prefs.getFloat(Prefs.KEY_GAP_X, Prefs.DEFAULT_GAP_X);
+        float gapY = prefs.getFloat(Prefs.KEY_GAP_Y, Prefs.DEFAULT_GAP_Y);
         float opacity = prefs.getFloat(Prefs.KEY_GLASS_OPACITY, Prefs.DEFAULT_GLASS_OPACITY);
         int sw = getResources().getDisplayMetrics().widthPixels;
         int sh = getResources().getDisplayMetrics().heightPixels;
@@ -398,9 +425,10 @@ public class GridEditorActivity extends Activity implements GlassGridView.CellTa
         rowsValue.setText(String.valueOf(rows));
         xValue.setText(Math.round(x0 * sw) + " px");
         yValue.setText(Math.round(y0 * sh) + " px");
-        gapXValue.setText(Math.round(sx * sw) + " px");
-        gapYValue.setText(Math.round(sy * sh) + " px");
-        sizeValue.setText(Math.round(size * sw) + " px");
+        widthValue.setText(Math.round(width * sw) + " px");
+        heightValue.setText(Math.round(height * sh) + " px");
+        gapXValue.setText(Math.round(gapX * sw) + " px");
+        gapYValue.setText(Math.round(gapY * sh) + " px");
         opacityValue.setText(Math.round(opacity * 100f) + "%");
     }
 

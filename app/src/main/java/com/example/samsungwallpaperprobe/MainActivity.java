@@ -28,6 +28,9 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences(Prefs.PREFS, MODE_PRIVATE);
+        Prefs.ensureV06GridDefaults(prefs,
+                getResources().getDisplayMetrics().widthPixels,
+                getResources().getDisplayMetrics().heightPixels);
         ensureDefaults();
         buildUi();
     }
@@ -48,9 +51,10 @@ public class MainActivity extends Activity {
         if (!prefs.contains(Prefs.KEY_GRID_ROWS)) e.putInt(Prefs.KEY_GRID_ROWS, Prefs.DEFAULT_ROWS);
         if (!prefs.contains(Prefs.KEY_GRID_X0)) e.putFloat(Prefs.KEY_GRID_X0, Prefs.DEFAULT_X0);
         if (!prefs.contains(Prefs.KEY_GRID_Y0)) e.putFloat(Prefs.KEY_GRID_Y0, Prefs.DEFAULT_Y0);
-        if (!prefs.contains(Prefs.KEY_GRID_STEP_X)) e.putFloat(Prefs.KEY_GRID_STEP_X, Prefs.DEFAULT_STEP_X);
-        if (!prefs.contains(Prefs.KEY_GRID_STEP_Y)) e.putFloat(Prefs.KEY_GRID_STEP_Y, Prefs.DEFAULT_STEP_Y);
-        if (!prefs.contains(Prefs.KEY_GLASS_SIZE)) e.putFloat(Prefs.KEY_GLASS_SIZE, Prefs.DEFAULT_GLASS_SIZE);
+        if (!prefs.contains(Prefs.KEY_CELL_WIDTH)) e.putFloat(Prefs.KEY_CELL_WIDTH, Prefs.DEFAULT_CELL_WIDTH);
+        if (!prefs.contains(Prefs.KEY_CELL_HEIGHT)) e.putFloat(Prefs.KEY_CELL_HEIGHT, Prefs.DEFAULT_CELL_HEIGHT);
+        if (!prefs.contains(Prefs.KEY_GAP_X)) e.putFloat(Prefs.KEY_GAP_X, Prefs.DEFAULT_GAP_X);
+        if (!prefs.contains(Prefs.KEY_GAP_Y)) e.putFloat(Prefs.KEY_GAP_Y, Prefs.DEFAULT_GAP_Y);
         if (!prefs.contains(Prefs.KEY_GLASS_OPACITY)) e.putFloat(Prefs.KEY_GLASS_OPACITY, Prefs.DEFAULT_GLASS_OPACITY);
         e.apply();
     }
@@ -68,12 +72,12 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView title = text("Iridescent Wallpaper Lab v0.5", 25f, Color.BLACK, true);
+        TextView title = text("Iridescent Wallpaper Lab v0.6", 25f, Color.BLACK, true);
         title.setGravity(Gravity.CENTER);
         root.addView(title, matchWrap());
 
         TextView body = text(
-                "Теперь стекло рисуется самим wallpaper под выбранными ячейками. В редакторе можно настроить сетку почти пиксельно и назначить приложение каждой ячейке. Отладка сохранена.",
+                "v0.6: ускоренный рендер стекла и новая геометрия сетки. Теперь отдельно настраиваются ширина/высота ячейки и реальные зазоры между ячейками по X/Y. Отладка сохранена и показывает FPS.",
                 16f, Color.DKGRAY, false);
         body.setGravity(Gravity.CENTER);
         body.setPadding(0, dp(14), 0, dp(20));
