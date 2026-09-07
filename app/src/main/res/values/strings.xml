@@ -1,5 +1,6 @@
-<?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Iridescent Wallpaper Lab</string>
-    <string name="wallpaper_name">Iridescent Glass Grid</string>
+    <string name="wallpaper_name">Iridescent Real Offset Lab</string>
+    <string name="accessibility_service_name">One UI Offset Probe</string>
+    <string name="accessibility_desc">Reads only One UI Home scroll accessibility events so the live wallpaper can follow the real home-screen page animation. It does not request access to other apps or window contents.</string>
 </resources>

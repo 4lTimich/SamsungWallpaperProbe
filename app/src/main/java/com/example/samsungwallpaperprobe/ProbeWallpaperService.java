@@ -5,36 +5,50 @@ import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
-import android.graphics.LinearGradient;
 import android.graphics.Paint;
-import android.graphics.RadialGradient;
 import android.graphics.RectF;
-import android.graphics.Shader;
-import android.os.Handler;
-import android.os.Looper;
+import android.opengl.EGL14;
+import android.opengl.EGLConfig;
+import android.opengl.EGLContext;
+import android.opengl.EGLDisplay;
+import android.opengl.EGLSurface;
+import android.opengl.GLES20;
+import android.opengl.GLUtils;
 import android.os.SystemClock;
 import android.service.wallpaper.WallpaperService;
 import android.view.MotionEvent;
 import android.view.SurfaceHolder;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
 import java.util.ArrayList;
 import java.util.Locale;
 
+/**
+ * v0.7: GPU wallpaper renderer + experimental real One UI scroll source.
+ *
+ * If the optional accessibility service reports a sane absolute scrollX/maxScrollX
+ * for One UI Home, glass follows that real launcher position. Otherwise the engine
+ * falls back to the previous raw-touch virtual-page model.
+ */
 public class ProbeWallpaperService extends WallpaperService {
 
     @Override
     public Engine onCreateEngine() {
-        return new VirtualPageEngine();
+        return new GpuEngine();
     }
 
-    private final class VirtualPageEngine extends Engine {
-        private final Handler handler = new Handler(Looper.getMainLooper());
-        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.DITHER_FLAG);
-        private final Paint bitmapPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.DITHER_FLAG | Paint.FILTER_BITMAP_FLAG);
-
+    private final class GpuEngine extends Engine {
+        private final Object stateLock = new Object();
         private SharedPreferences prefs;
-        private boolean visible = false;
+        private RenderThread renderThread;
 
+        private volatile boolean visible = false;
+        private volatile int surfaceW = 1;
+        private volatile int surfaceH = 1;
+
+        // Persistent page state.
         private int pageCount = 4;
         private int currentPage = 0;
         private int targetPage = 0;
@@ -42,16 +56,14 @@ public class ProbeWallpaperService extends WallpaperService {
         private float swipeSensitivity = 1.80f;
         private boolean showDebug = false;
 
-        // Background material position can be more sensitive than the real page.
+        // Visual positions.
         private float virtualPosition = 0f;
+        private float glassPosition = 0f;
         private float visualVelocity = 0f;
+        private float glassVelocity = 0f;
         private float motionEnergy = 0f;
 
-        // Glass grid remains 1:1 with One UI page motion.
-        private float glassPosition = 0f;
-        private float glassVelocity = 0f;
-
-        private long lastFrameNs = 0L;
+        // Touch fallback state.
         private boolean dragging = false;
         private float downX = 0f;
         private float downY = 0f;
@@ -65,19 +77,23 @@ public class ProbeWallpaperService extends WallpaperService {
         private int gestureBasePage = 0;
         private String lastDecision = "READY";
 
-        // v0.6 performance: low-resolution material buffer + cached glass tile.
-        private Bitmap backgroundBitmap;
-        private Canvas backgroundCanvas;
-        private int backgroundW = 0;
-        private int backgroundH = 0;
-        private int frameSequence = 0;
+        // Accessibility real-offset state.
+        private long lastBusSequence = -1L;
+        private boolean realOffsetLocked = false;
+        private float realPosition = 0f;
+        private long lastRealEventMs = 0L;
+        private boolean realSettledForEvent = true;
+        private String offsetSource = "TOUCH";
+        private int a11yScrollX = -1;
+        private int a11yMaxScrollX = -1;
+        private int a11yDeltaX = 0;
+        private int a11yFrom = -1;
+        private int a11yTo = -1;
+        private int a11yCount = -1;
+        private String a11yClass = "";
+        private String a11ySummary = "";
 
-        private Bitmap glassBitmap;
-        private int glassBitmapW = 0;
-        private int glassBitmapH = 0;
-        private float glassBitmapOpacity = -1f;
-
-        // Cached grid geometry and assigned cells. No SharedPreferences scanning each frame.
+        // Grid cache.
         private int gridCols = Prefs.DEFAULT_COLS;
         private int gridRows = Prefs.DEFAULT_ROWS;
         private float gridX0 = Prefs.DEFAULT_X0;
@@ -88,27 +104,12 @@ public class ProbeWallpaperService extends WallpaperService {
         private float gapY = Prefs.DEFAULT_GAP_Y;
         private float glassOpacity = Prefs.DEFAULT_GLASS_OPACITY;
         private ArrayList<Cell>[] cellsByPage;
-        private boolean gridDirty = true;
-        private boolean glassBitmapDirty = true;
-
-        // FPS diagnostics.
-        private long fpsWindowNs = 0L;
-        private int fpsFrames = 0;
-        private float measuredFps = 0f;
-        private boolean lastFrameHardware = false;
+        private volatile boolean gridDirty = true;
 
         private final class Cell {
-            final int row;
-            final int col;
+            final int row, col;
             Cell(int row, int col) { this.row = row; this.col = col; }
         }
-
-        private final Runnable drawRunner = new Runnable() {
-            @Override
-            public void run() {
-                drawFrame();
-            }
-        };
 
         private final SharedPreferences.OnSharedPreferenceChangeListener prefsListener =
                 (sharedPreferences, key) -> {
@@ -126,11 +127,6 @@ public class ProbeWallpaperService extends WallpaperService {
                             || Prefs.KEY_PAGE_COUNT.equals(key)) {
                         gridDirty = true;
                     }
-                    if (Prefs.KEY_CELL_WIDTH.equals(key)
-                            || Prefs.KEY_CELL_HEIGHT.equals(key)
-                            || Prefs.KEY_GLASS_OPACITY.equals(key)) {
-                        glassBitmapDirty = true;
-                    }
                     if (Prefs.KEY_SHOW_DEBUG.equals(key)) {
                         showDebug = sharedPreferences.getBoolean(Prefs.KEY_SHOW_DEBUG, showDebug);
                     }
@@ -141,8 +137,8 @@ public class ProbeWallpaperService extends WallpaperService {
                 };
 
         @Override
-        public void onCreate(SurfaceHolder surfaceHolder) {
-            super.onCreate(surfaceHolder);
+        public void onCreate(SurfaceHolder holder) {
+            super.onCreate(holder);
             setTouchEventsEnabled(true);
             setOffsetNotificationsEnabled(false);
             prefs = getSharedPreferences(Prefs.PREFS, Context.MODE_PRIVATE);
@@ -154,32 +150,25 @@ public class ProbeWallpaperService extends WallpaperService {
         }
 
         private void loadPersistentState(boolean forcePosition) {
-            if (prefs == null) return;
-
-            pageCount = clampInt(prefs.getInt(Prefs.KEY_PAGE_COUNT, 4), 2, 9);
-            swipeSensitivity = clamp(prefs.getFloat(Prefs.KEY_SWIPE_SENSITIVITY, 1.80f), 0.70f, 2.60f);
-            showDebug = prefs.getBoolean(Prefs.KEY_SHOW_DEBUG, false);
-
-            int generation = prefs.getInt(Prefs.KEY_CONFIG_GENERATION, 0);
-            int saved = clampInt(prefs.getInt(Prefs.KEY_SAVED_PAGE, 0), 0, pageCount - 1);
-
-            if (forcePosition || generation != lastConfigGeneration) {
-                currentPage = saved;
-                targetPage = saved;
-                virtualPosition = saved;
-                glassPosition = saved;
-                visualVelocity = 0f;
-                glassVelocity = 0f;
-                dragging = false;
-            } else {
-                currentPage = clampInt(currentPage, 0, pageCount - 1);
-                targetPage = clampInt(targetPage, 0, pageCount - 1);
-                virtualPosition = clamp(virtualPosition, -0.22f, pageCount - 1f + 0.22f);
-                glassPosition = clamp(glassPosition, -0.18f, pageCount - 1f + 0.18f);
+            synchronized (stateLock) {
+                pageCount = clampInt(prefs.getInt(Prefs.KEY_PAGE_COUNT, 4), 2, 9);
+                swipeSensitivity = clamp(prefs.getFloat(Prefs.KEY_SWIPE_SENSITIVITY, 1.80f), 0.70f, 2.60f);
+                showDebug = prefs.getBoolean(Prefs.KEY_SHOW_DEBUG, false);
+                int generation = prefs.getInt(Prefs.KEY_CONFIG_GENERATION, 0);
+                int saved = clampInt(prefs.getInt(Prefs.KEY_SAVED_PAGE, 0), 0, pageCount - 1);
+                if (forcePosition || generation != lastConfigGeneration) {
+                    currentPage = saved;
+                    targetPage = saved;
+                    virtualPosition = saved;
+                    glassPosition = saved;
+                    realPosition = saved;
+                    visualVelocity = 0f;
+                    glassVelocity = 0f;
+                    dragging = false;
+                }
+                lastConfigGeneration = generation;
+                gridDirty = true;
             }
-
-            lastConfigGeneration = generation;
-            gridDirty = true;
         }
 
         private void saveStablePage() {
@@ -188,45 +177,54 @@ public class ProbeWallpaperService extends WallpaperService {
         }
 
         @Override
-        public void onVisibilityChanged(boolean isVisible) {
-            visible = isVisible;
-            if (visible) {
-                loadPersistentState(false);
-                lastFrameNs = 0L;
-                drawFrame();
-            } else {
-                saveStablePage();
-                handler.removeCallbacks(drawRunner);
-                lastFrameNs = 0L;
+        public void onSurfaceCreated(SurfaceHolder holder) {
+            super.onSurfaceCreated(holder);
+            if (renderThread == null) {
+                renderThread = new RenderThread(holder);
+                renderThread.start();
             }
         }
 
         @Override
         public void onSurfaceChanged(SurfaceHolder holder, int format, int width, int height) {
             super.onSurfaceChanged(holder, format, width, height);
-            backgroundW = 0;
-            backgroundH = 0;
-            glassBitmapDirty = true;
+            surfaceW = Math.max(1, width);
+            surfaceH = Math.max(1, height);
             gridDirty = true;
-            drawFrame();
+        }
+
+        @Override
+        public void onVisibilityChanged(boolean isVisible) {
+            visible = isVisible;
+            if (isVisible) {
+                int generation = prefs.getInt(Prefs.KEY_CONFIG_GENERATION, lastConfigGeneration);
+                if (generation != lastConfigGeneration) loadPersistentState(false);
+                if (renderThread != null) renderThread.wakeUp();
+            } else {
+                saveStablePage();
+            }
         }
 
         @Override
         public void onSurfaceDestroyed(SurfaceHolder holder) {
-            saveStablePage();
             visible = false;
-            handler.removeCallbacks(drawRunner);
-            lastFrameNs = 0L;
+            saveStablePage();
+            if (renderThread != null) {
+                renderThread.requestStop();
+                try { renderThread.join(1500L); } catch (InterruptedException ignored) {}
+                renderThread = null;
+            }
             super.onSurfaceDestroyed(holder);
         }
 
         @Override
         public void onDestroy() {
             saveStablePage();
-            handler.removeCallbacks(drawRunner);
             if (prefs != null) prefs.unregisterOnSharedPreferenceChangeListener(prefsListener);
-            if (backgroundBitmap != null) backgroundBitmap.recycle();
-            if (glassBitmap != null) glassBitmap.recycle();
+            if (renderThread != null) {
+                renderThread.requestStop();
+                renderThread = null;
+            }
             super.onDestroy();
         }
 
@@ -234,80 +232,89 @@ public class ProbeWallpaperService extends WallpaperService {
         public void onTouchEvent(MotionEvent event) {
             super.onTouchEvent(event);
             final long now = SystemClock.uptimeMillis();
-            touchX = event.getX();
-            touchY = event.getY();
-
-            switch (event.getActionMasked()) {
-                case MotionEvent.ACTION_DOWN:
-                    dragging = true;
-                    gestureBasePage = currentPage;
-                    targetPage = currentPage;
-                    downX = touchX;
-                    downY = touchY;
-                    touchDx = 0f;
-                    touchDy = 0f;
-                    touchVelocityX = 0f;
-                    prevMoveX = touchX;
-                    prevMoveMs = now;
-                    visualVelocity = 0f;
-                    glassVelocity = 0f;
-                    lastDecision = "DRAGGING";
-                    break;
-
-                case MotionEvent.ACTION_MOVE:
-                    if (!dragging) break;
-                    touchDx = touchX - downX;
-                    touchDy = touchY - downY;
-                    long dtMs = now - prevMoveMs;
-                    if (dtMs > 0) {
-                        float instantVx = (touchX - prevMoveX) * 1000f / dtMs;
-                        touchVelocityX = touchVelocityX * 0.54f + instantVx * 0.46f;
-                    }
-                    prevMoveX = touchX;
-                    prevMoveMs = now;
-                    updateDraggedPositions();
-                    break;
-
-                case MotionEvent.ACTION_UP:
-                    if (dragging) {
+            synchronized (stateLock) {
+                touchX = event.getX();
+                touchY = event.getY();
+                switch (event.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        dragging = true;
+                        gestureBasePage = currentPage;
+                        targetPage = currentPage;
+                        downX = touchX;
+                        downY = touchY;
+                        touchDx = 0f;
+                        touchDy = 0f;
+                        touchVelocityX = 0f;
+                        prevMoveX = touchX;
+                        prevMoveMs = now;
+                        visualVelocity = 0f;
+                        glassVelocity = 0f;
+                        lastDecision = realOffsetLocked ? "A11Y + TOUCH" : "DRAGGING";
+                        break;
+                    case MotionEvent.ACTION_MOVE:
+                        if (!dragging) break;
                         touchDx = touchX - downX;
                         touchDy = touchY - downY;
-                        finishGesture(false);
-                    }
-                    break;
-
-                case MotionEvent.ACTION_CANCEL:
-                    if (dragging) {
+                        long dtMs = now - prevMoveMs;
+                        if (dtMs > 0) {
+                            float instantVx = (touchX - prevMoveX) * 1000f / dtMs;
+                            touchVelocityX = touchVelocityX * 0.54f + instantVx * 0.46f;
+                        }
+                        prevMoveX = touchX;
+                        prevMoveMs = now;
+                        if (!realOffsetLocked) updateFallbackDraggedPositions();
+                        break;
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_CANCEL:
+                        if (!dragging) break;
                         touchDx = touchX - downX;
                         touchDy = touchY - downY;
-                        finishGesture(true);
-                    }
-                    break;
+                        dragging = false;
+                        if (!realOffsetLocked) {
+                            finishFallbackGesture(event.getActionMasked() == MotionEvent.ACTION_CANCEL);
+                        } else {
+                            // Real One UI scroll events, not our finger heuristic, decide the page.
+                            lastDecision = "WAITING FOR ONE UI";
+                        }
+                        break;
+                }
             }
-            // Immediate render on every input event; scheduled frames continue between events.
-            drawFrame();
+            if (renderThread != null) renderThread.wakeUp();
         }
 
-        private void updateDraggedPositions() {
-            int w = getSurfaceHolder().getSurfaceFrame().width();
-            if (w <= 0) return;
-
+        private void updateFallbackDraggedPositions() {
+            int w = Math.max(1, surfaceW);
             float rawPageDelta = -touchDx / w;
+            virtualPosition = applyEdgeRubber(gestureBasePage + rawPageDelta * swipeSensitivity, 0.28f);
+            glassPosition = applyEdgeRubber(gestureBasePage + rawPageDelta, 0.20f);
+            offsetSource = "TOUCH";
+        }
 
-            float backgroundRaw = gestureBasePage + rawPageDelta * swipeSensitivity;
-            virtualPosition = applyEdgeRubber(backgroundRaw, 0.28f);
-
-            // Exactly 1:1 with the finger / One UI page movement.
-            float glassRaw = gestureBasePage + rawPageDelta;
-            glassPosition = applyEdgeRubber(glassRaw, 0.20f);
+        private void finishFallbackGesture(boolean fromCancel) {
+            int w = Math.max(1, surfaceW);
+            float distancePages = (-touchDx / w) * Math.min(swipeSensitivity, 1.65f);
+            float velocityPages = (-touchVelocityX / w) * Math.min(swipeSensitivity, 1.50f);
+            boolean horizontal = Math.abs(touchDx) > Math.abs(touchDy) * 0.70f;
+            boolean strongDistance = Math.abs(distancePages) >= 0.21f;
+            boolean strongVelocity = Math.abs(velocityPages) >= 0.58f;
+            int direction = 0;
+            if (horizontal && (strongDistance || strongVelocity)) {
+                float signal = Math.abs(distancePages) >= 0.065f ? distancePages : velocityPages;
+                direction = signal > 0f ? 1 : -1;
+            }
+            int proposedPage = clampInt(gestureBasePage + direction, 0, pageCount - 1);
+            currentPage = proposedPage;
+            targetPage = proposedPage;
+            visualVelocity = clamp(velocityPages * 0.24f, -2.15f, 2.15f);
+            glassVelocity = clamp((-touchVelocityX / w) * 0.18f, -1.40f, 1.40f);
+            lastDecision = direction == 0 ? "RETURN PAGE " + (currentPage + 1)
+                    : String.format(Locale.US, "%s -> PAGE %d", fromCancel ? "FLING" : "SWIPE", currentPage + 1);
+            saveStablePage();
         }
 
         private float applyEdgeRubber(float raw, float strength) {
-            if (raw < 0f) {
-                return -rubberBand(-raw, strength);
-            } else if (raw > pageCount - 1f) {
-                return (pageCount - 1f) + rubberBand(raw - (pageCount - 1f), strength);
-            }
+            if (raw < 0f) return -rubberBand(-raw, strength);
+            if (raw > pageCount - 1f) return (pageCount - 1f) + rubberBand(raw - (pageCount - 1f), strength);
             return raw;
         }
 
@@ -315,420 +322,492 @@ public class ProbeWallpaperService extends WallpaperService {
             return beyond * strength / (1f + beyond * 1.55f);
         }
 
-        private void finishGesture(boolean fromCancel) {
-            dragging = false;
-            int w = Math.max(1, getSurfaceHolder().getSurfaceFrame().width());
+        private void pollAccessibilityRealOffset(long nowMs) {
+            long seq = LauncherScrollBus.sequence;
+            if (seq == lastBusSequence) {
+                settleRealOffsetIfNeeded(nowMs);
+                return;
+            }
+            lastBusSequence = seq;
+            a11yScrollX = LauncherScrollBus.scrollX;
+            a11yMaxScrollX = LauncherScrollBus.maxScrollX;
+            a11yDeltaX = LauncherScrollBus.deltaX;
+            a11yFrom = LauncherScrollBus.fromIndex;
+            a11yTo = LauncherScrollBus.toIndex;
+            a11yCount = LauncherScrollBus.itemCount;
+            a11yClass = LauncherScrollBus.className;
+            a11ySummary = LauncherScrollBus.summary;
 
-            float distancePages = (-touchDx / w) * Math.min(swipeSensitivity, 1.65f);
-            float velocityPages = (-touchVelocityX / w) * Math.min(swipeSensitivity, 1.50f);
-            boolean horizontal = Math.abs(touchDx) > Math.abs(touchDy) * 0.70f;
-
-            boolean strongDistance = Math.abs(distancePages) >= 0.21f;
-            boolean strongVelocity = Math.abs(velocityPages) >= 0.58f;
-
-            int direction = 0;
-            if (horizontal && (strongDistance || strongVelocity)) {
-                float signal = Math.abs(distancePages) >= 0.065f ? distancePages : velocityPages;
-                direction = signal > 0f ? 1 : -1;
+            if (!LauncherScrollBus.serviceConnected) {
+                realOffsetLocked = false;
+                offsetSource = "TOUCH";
+                return;
             }
 
-            int proposedPage = clampInt(gestureBasePage + direction, 0, pageCount - 1);
-            boolean changed = proposedPage != gestureBasePage;
-
-            currentPage = proposedPage;
-            targetPage = proposedPage;
-
-            visualVelocity = clamp(velocityPages * 0.24f, -2.15f, 2.15f);
-            glassVelocity = clamp((-touchVelocityX / w) * 0.18f, -1.40f, 1.40f);
-
-            if (changed) {
-                lastDecision = String.format(Locale.US, "%s -> PAGE %d SAVED",
-                        fromCancel ? "FLING" : "SWIPE", currentPage + 1);
-            } else if (direction != 0) {
-                lastDecision = "EDGE: PAGE " + (currentPage + 1);
-            } else {
-                lastDecision = "RETURN PAGE " + (currentPage + 1);
-            }
-
-            saveStablePage();
-        }
-
-        private void advancePhysics(float dt, int width) {
-            if (!dragging) {
-                float bgDisplacement = targetPage - virtualPosition;
-                float bgAccel = bgDisplacement * 42f - visualVelocity * 10.8f;
-                visualVelocity += bgAccel * dt;
-                virtualPosition += visualVelocity * dt;
-                virtualPosition = clamp(virtualPosition, -0.20f, pageCount - 1f + 0.20f);
-
-                float glassDisplacement = targetPage - glassPosition;
-                // Faster glass spring than v0.5 so it does not visibly lag behind icons.
-                float glassAccel = glassDisplacement * 68f - glassVelocity * 15.8f;
-                glassVelocity += glassAccel * dt;
-                glassPosition += glassVelocity * dt;
-                glassPosition = clamp(glassPosition, -0.12f, pageCount - 1f + 0.12f);
-
-                if (Math.abs(targetPage - virtualPosition) < 0.0014f && Math.abs(visualVelocity) < 0.008f) {
-                    virtualPosition = targetPage;
-                    visualVelocity = 0f;
-                }
-                if (Math.abs(targetPage - glassPosition) < 0.0008f && Math.abs(glassVelocity) < 0.005f) {
-                    glassPosition = targetPage;
-                    glassVelocity = 0f;
+            // Best case: One UI exposes an absolute horizontal scroll position.
+            // Accept it only if one page step is plausibly close to one screen width.
+            if (a11yMaxScrollX > 0 && a11yScrollX >= 0 && pageCount > 1) {
+                float stepPx = a11yMaxScrollX / (float) (pageCount - 1);
+                float w = Math.max(1f, surfaceW);
+                boolean plausible = stepPx >= w * 0.45f && stepPx <= w * 1.85f
+                        && a11yScrollX <= a11yMaxScrollX + w * 0.25f;
+                if (plausible) {
+                    float p = clamp(a11yScrollX / stepPx, 0f, pageCount - 1f);
+                    synchronized (stateLock) {
+                        realPosition = p;
+                        glassPosition = p;
+                        float base = dragging ? gestureBasePage : currentPage;
+                        virtualPosition = applyEdgeRubber(base + (p - base) * swipeSensitivity, 0.24f);
+                        visualVelocity = 0f;
+                        glassVelocity = 0f;
+                        realOffsetLocked = true;
+                        offsetSource = "A11Y REAL";
+                        lastRealEventMs = nowMs;
+                        realSettledForEvent = false;
+                        lastDecision = "ONE UI REAL SCROLL";
+                    }
+                    return;
                 }
             }
 
-            float pageTouchSpeed = width > 0 ? Math.abs(touchVelocityX) / width : 0f;
-            float desiredEnergy = dragging
-                    ? clamp(pageTouchSpeed * 0.42f, 0f, 1f)
-                    : clamp(Math.abs(visualVelocity) * 0.55f, 0f, 1f);
-            float response = desiredEnergy > motionEnergy ? 12f : 4.3f;
-            motionEnergy += (desiredEnergy - motionEnergy) * clamp(dt * response, 0f, 1f);
+            // Some pagers report only a page index. This is useful as an authoritative
+            // final-page correction even when they do not expose continuous scrollX.
+            if (a11yCount == pageCount && a11yTo >= 0 && a11yTo < pageCount) {
+                synchronized (stateLock) {
+                    currentPage = a11yTo;
+                    targetPage = a11yTo;
+                    glassPosition = a11yTo;
+                    virtualPosition = a11yTo;
+                    realPosition = a11yTo;
+                    realOffsetLocked = true;
+                    offsetSource = "A11Y PAGE";
+                    lastRealEventMs = nowMs;
+                    realSettledForEvent = false;
+                    lastDecision = "ONE UI PAGE " + (a11yTo + 1);
+                }
+            }
+            settleRealOffsetIfNeeded(nowMs);
         }
 
-        private void drawFrame() {
-            handler.removeCallbacks(drawRunner);
-            SurfaceHolder holder = getSurfaceHolder();
-            Canvas canvas = null;
-            boolean hardware = false;
-
-            try {
-                try {
-                    canvas = holder.lockHardwareCanvas();
-                    hardware = canvas != null;
-                } catch (Throwable ignored) {
-                    canvas = null;
-                }
-                if (canvas == null) {
-                    canvas = holder.lockCanvas();
-                    hardware = false;
-                }
-                if (canvas == null) return;
-
-                int w = canvas.getWidth();
-                int h = canvas.getHeight();
-                long nowNs = System.nanoTime();
-
-                float dt = 1f / 60f;
-                if (lastFrameNs != 0L) {
-                    dt = clamp((nowNs - lastFrameNs) / 1_000_000_000f, 0.001f, 0.05f);
-                }
-                lastFrameNs = nowNs;
-
-                int generation = prefs.getInt(Prefs.KEY_CONFIG_GENERATION, lastConfigGeneration);
-                if (generation != lastConfigGeneration) loadPersistentState(false);
-                if (gridDirty) rebuildGridCache(w, h);
-
-                advancePhysics(dt, w);
-                frameSequence++;
-
-                // Material updates at 30fps, while cached glass can track at 60fps.
-                // This cuts the expensive gradient work roughly in half without making
-                // the icon-alignment layer feel slow.
-                boolean renderMaterial = backgroundBitmap == null || (frameSequence & 1) == 0;
-                drawIridescentBackground(canvas, w, h, renderMaterial);
-                drawGlassPages(canvas, w, h);
-
-                lastFrameHardware = hardware;
-                updateFps(nowNs);
-                if (showDebug) drawDiagnostics(canvas, w, h);
-
-            } finally {
-                if (canvas != null) holder.unlockCanvasAndPost(canvas);
-            }
-
-            if (visible) {
-                boolean active = dragging
-                        || Math.abs(visualVelocity) > 0.01f
-                        || Math.abs(glassVelocity) > 0.01f
-                        || motionEnergy > 0.02f;
-                handler.postDelayed(drawRunner, active ? 16L : 33L);
+        private void settleRealOffsetIfNeeded(long nowMs) {
+            if (!realOffsetLocked || realSettledForEvent) return;
+            if (nowMs - lastRealEventMs < 180L) return;
+            synchronized (stateLock) {
+                int settled = clampInt(Math.round(realPosition), 0, pageCount - 1);
+                currentPage = settled;
+                targetPage = settled;
+                glassPosition = settled;
+                virtualPosition = settled;
+                visualVelocity = 0f;
+                glassVelocity = 0f;
+                realSettledForEvent = true;
+                lastDecision = "REAL PAGE " + (settled + 1) + " SAVED";
+                saveStablePage();
             }
         }
 
-        private void updateFps(long nowNs) {
-            if (fpsWindowNs == 0L) fpsWindowNs = nowNs;
-            fpsFrames++;
-            long elapsed = nowNs - fpsWindowNs;
-            if (elapsed >= 1_000_000_000L) {
-                measuredFps = fpsFrames * 1_000_000_000f / elapsed;
-                fpsFrames = 0;
-                fpsWindowNs = nowNs;
+        private void advanceFallbackPhysics(float dt) {
+            synchronized (stateLock) {
+                if (!realOffsetLocked && !dragging) {
+                    float bgD = targetPage - virtualPosition;
+                    visualVelocity += (bgD * 42f - visualVelocity * 10.8f) * dt;
+                    virtualPosition += visualVelocity * dt;
+
+                    float glassD = targetPage - glassPosition;
+                    glassVelocity += (glassD * 68f - glassVelocity * 15.8f) * dt;
+                    glassPosition += glassVelocity * dt;
+                }
+                float touchSpeed = Math.abs(touchVelocityX) / Math.max(1f, surfaceW);
+                float desired = dragging ? clamp(touchSpeed * 0.42f, 0f, 1f)
+                        : clamp(Math.abs(visualVelocity) * 0.55f, 0f, 1f);
+                float response = desired > motionEnergy ? 12f : 4.3f;
+                motionEnergy += (desired - motionEnergy) * clamp(dt * response, 0f, 1f);
             }
-        }
-
-        private void ensureBackgroundBuffer(int w, int h) {
-            // Smooth gradients do not need full phone resolution. Scaling a half-ish
-            // resolution material buffer is much cheaper on Canvas and remains smooth.
-            int bw = Math.max(220, Math.round(w * 0.45f));
-            int bh = Math.max(420, Math.round(h * 0.45f));
-            if (backgroundBitmap != null && bw == backgroundW && bh == backgroundH) return;
-
-            if (backgroundBitmap != null) backgroundBitmap.recycle();
-            backgroundBitmap = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888);
-            backgroundCanvas = new Canvas(backgroundBitmap);
-            backgroundW = bw;
-            backgroundH = bh;
-        }
-
-        private void drawIridescentBackground(Canvas target, int w, int h, boolean rerender) {
-            ensureBackgroundBuffer(w, h);
-            if (rerender) renderMaterial(backgroundCanvas, backgroundW, backgroundH);
-            bitmapPaint.setAlpha(255);
-            target.drawBitmap(backgroundBitmap, null, new RectF(0, 0, w, h), bitmapPaint);
-        }
-
-        private void renderMaterial(Canvas canvas, int w, int h) {
-            float time = SystemClock.elapsedRealtime() / 1000f;
-            float pos = virtualPosition;
-            float direction = dragging ? Math.signum(-touchVelocityX) : Math.signum(visualVelocity);
-            float split = w * (0.018f + motionEnergy * 0.060f) * direction;
-
-            paint.setStyle(Paint.Style.FILL);
-            paint.setShader(new LinearGradient(
-                    0f, 0f, w, h,
-                    new int[]{Color.rgb(2, 4, 12), Color.rgb(5, 13, 30), Color.rgb(24, 6, 31), Color.rgb(5, 6, 12)},
-                    new float[]{0f, 0.34f, 0.72f, 1f}, Shader.TileMode.CLAMP));
-            canvas.drawRect(0, 0, w, h, paint);
-            paint.setShader(null);
-
-            float pagePhase = pos * 0.62f;
-            float breathe = (float) Math.sin(time * 0.23f);
-
-            drawGlow(canvas,
-                    w * (0.12f + 0.22f * (float) Math.sin(pagePhase + time * 0.08f)) - split,
-                    h * (0.28f + 0.08f * (float) Math.cos(time * 0.17f + pagePhase)),
-                    Math.max(w, h) * 0.68f, Color.rgb(0, 225, 255), 176);
-
-            drawGlow(canvas,
-                    w * (0.78f + 0.15f * (float) Math.cos(pagePhase * 1.11f - time * 0.06f)) + split,
-                    h * (0.38f + 0.10f * (float) Math.sin(time * 0.14f - pagePhase)),
-                    Math.max(w, h) * 0.61f, Color.rgb(86, 34, 255), 172);
-
-            drawGlow(canvas,
-                    w * (0.28f + 0.24f * (float) Math.cos(pagePhase * 0.91f + 1.7f)) + split * 0.70f,
-                    h * (0.76f + 0.05f * breathe),
-                    Math.max(w, h) * 0.58f, Color.rgb(255, 0, 181), 150);
-
-            drawGlow(canvas,
-                    w * (0.92f - 0.22f * (float) Math.sin(pagePhase * 0.77f + 0.8f)) - split * 0.45f,
-                    h * (0.82f - 0.05f * (float) Math.cos(time * 0.19f)),
-                    Math.max(w, h) * 0.50f, Color.rgb(255, 118, 24), 122);
-
-            float lightTravel = (pos * 0.29f + time * 0.018f) * w;
-            paint.setShader(new LinearGradient(
-                    -w * 0.55f - lightTravel, h * 0.06f,
-                    w * 1.55f - lightTravel, h * 0.93f,
-                    new int[]{
-                            Color.TRANSPARENT,
-                            Color.argb(16, 120, 230, 255),
-                            Color.argb((int) (38 + motionEnergy * 40), 255, 255, 255),
-                            Color.argb(18, 255, 95, 230),
-                            Color.TRANSPARENT
-                    },
-                    new float[]{0f, 0.40f, 0.50f, 0.60f, 1f}, Shader.TileMode.CLAMP));
-            canvas.drawRect(0, 0, w, h, paint);
-            paint.setShader(null);
-
-            paint.setShader(new RadialGradient(
-                    w * 0.50f, h * 0.46f, Math.max(w, h) * 0.82f,
-                    new int[]{Color.TRANSPARENT, Color.argb(108, 0, 0, 0)},
-                    new float[]{0.48f, 1f}, Shader.TileMode.CLAMP));
-            canvas.drawRect(0, 0, w, h, paint);
-            paint.setShader(null);
-        }
-
-        private void drawGlow(Canvas canvas, float x, float y, float radius, int rgb, int alpha) {
-            int r = Color.red(rgb);
-            int g = Color.green(rgb);
-            int b = Color.blue(rgb);
-            paint.setShader(new RadialGradient(
-                    x, y, radius,
-                    new int[]{
-                            Color.argb(alpha, r, g, b),
-                            Color.argb((int) (alpha * 0.52f), r, g, b),
-                            Color.argb(0, r, g, b)
-                    },
-                    new float[]{0f, 0.36f, 1f}, Shader.TileMode.CLAMP));
-            canvas.drawCircle(x, y, radius, paint);
-            paint.setShader(null);
         }
 
         @SuppressWarnings("unchecked")
-        private void rebuildGridCache(int w, int h) {
+        private void rebuildGridCache() {
+            int w = Math.max(1, surfaceW), h = Math.max(1, surfaceH);
             Prefs.ensureV06GridDefaults(prefs, w, h);
-            pageCount = clampInt(prefs.getInt(Prefs.KEY_PAGE_COUNT, pageCount), 2, 9);
-            gridCols = clampInt(prefs.getInt(Prefs.KEY_GRID_COLS, Prefs.DEFAULT_COLS), 2, 7);
-            gridRows = clampInt(prefs.getInt(Prefs.KEY_GRID_ROWS, Prefs.DEFAULT_ROWS), 2, 9);
-            gridX0 = clamp(prefs.getFloat(Prefs.KEY_GRID_X0, Prefs.DEFAULT_X0), -0.20f, 1.20f);
-            gridY0 = clamp(prefs.getFloat(Prefs.KEY_GRID_Y0, Prefs.DEFAULT_Y0), -0.20f, 1.20f);
-            cellWidth = clamp(prefs.getFloat(Prefs.KEY_CELL_WIDTH, Prefs.DEFAULT_CELL_WIDTH), 0.03f, 0.40f);
-            cellHeight = clamp(prefs.getFloat(Prefs.KEY_CELL_HEIGHT, Prefs.DEFAULT_CELL_HEIGHT), 0.015f, 0.25f);
-            gapX = clamp(prefs.getFloat(Prefs.KEY_GAP_X, Prefs.DEFAULT_GAP_X), 0f, 0.40f);
-            gapY = clamp(prefs.getFloat(Prefs.KEY_GAP_Y, Prefs.DEFAULT_GAP_Y), 0f, 0.30f);
-            glassOpacity = clamp(prefs.getFloat(Prefs.KEY_GLASS_OPACITY, Prefs.DEFAULT_GLASS_OPACITY), 0.05f, 0.95f);
+            synchronized (stateLock) {
+                pageCount = clampInt(prefs.getInt(Prefs.KEY_PAGE_COUNT, pageCount), 2, 9);
+                gridCols = clampInt(prefs.getInt(Prefs.KEY_GRID_COLS, Prefs.DEFAULT_COLS), 2, 7);
+                gridRows = clampInt(prefs.getInt(Prefs.KEY_GRID_ROWS, Prefs.DEFAULT_ROWS), 2, 9);
+                gridX0 = clamp(prefs.getFloat(Prefs.KEY_GRID_X0, Prefs.DEFAULT_X0), -0.20f, 1.20f);
+                gridY0 = clamp(prefs.getFloat(Prefs.KEY_GRID_Y0, Prefs.DEFAULT_Y0), -0.20f, 1.20f);
+                cellWidth = clamp(prefs.getFloat(Prefs.KEY_CELL_WIDTH, Prefs.DEFAULT_CELL_WIDTH), 0.03f, 0.40f);
+                cellHeight = clamp(prefs.getFloat(Prefs.KEY_CELL_HEIGHT, Prefs.DEFAULT_CELL_HEIGHT), 0.015f, 0.25f);
+                gapX = clamp(prefs.getFloat(Prefs.KEY_GAP_X, Prefs.DEFAULT_GAP_X), 0f, 0.40f);
+                gapY = clamp(prefs.getFloat(Prefs.KEY_GAP_Y, Prefs.DEFAULT_GAP_Y), 0f, 0.30f);
+                glassOpacity = clamp(prefs.getFloat(Prefs.KEY_GLASS_OPACITY, Prefs.DEFAULT_GLASS_OPACITY), 0.05f, 0.95f);
+                cellsByPage = (ArrayList<Cell>[]) new ArrayList[pageCount];
+                for (int p = 0; p < pageCount; p++) {
+                    ArrayList<Cell> cells = new ArrayList<>();
+                    for (int r = 0; r < gridRows; r++) {
+                        for (int c = 0; c < gridCols; c++) {
+                            String pkg = prefs.getString(Prefs.cellKey(p, r, c), null);
+                            if (pkg != null && !pkg.isEmpty()) cells.add(new Cell(r, c));
+                        }
+                    }
+                    cellsByPage[p] = cells;
+                }
+                gridDirty = false;
+            }
+        }
 
-            cellsByPage = (ArrayList<Cell>[]) new ArrayList[pageCount];
-            for (int page = 0; page < pageCount; page++) {
-                ArrayList<Cell> cells = new ArrayList<>();
-                for (int row = 0; row < gridRows; row++) {
-                    for (int col = 0; col < gridCols; col++) {
-                        String pkg = prefs.getString(Prefs.cellKey(page, row, col), null);
-                        if (pkg != null && !pkg.isEmpty()) cells.add(new Cell(row, col));
+        private final class RenderThread extends Thread {
+            private final SurfaceHolder holder;
+            private volatile boolean running = true;
+            private final Object waitLock = new Object();
+
+            private EGLDisplay eglDisplay = EGL14.EGL_NO_DISPLAY;
+            private EGLContext eglContext = EGL14.EGL_NO_CONTEXT;
+            private EGLSurface eglSurface = EGL14.EGL_NO_SURFACE;
+
+            private int bgProgram, glassProgram, texProgram;
+            private int quadBuffer;
+            private FloatBuffer quad;
+            private int debugTexture = 0;
+            private Bitmap debugBitmap;
+            private Canvas debugCanvas;
+            private Paint debugPaint;
+            private long lastDebugUploadMs = 0L;
+
+            private long fpsStartNs = 0L;
+            private int fpsFrames = 0;
+            private float measuredFps = 0f;
+
+            RenderThread(SurfaceHolder holder) {
+                super("IridescentGL");
+                this.holder = holder;
+            }
+
+            void requestStop() {
+                running = false;
+                wakeUp();
+            }
+
+            void wakeUp() {
+                synchronized (waitLock) { waitLock.notifyAll(); }
+            }
+
+            @Override
+            public void run() {
+                if (!initEgl()) return;
+                initGl();
+                long lastNs = System.nanoTime();
+                long nextFrameNs = lastNs;
+
+                while (running) {
+                    if (!visible) {
+                        synchronized (waitLock) {
+                            try { waitLock.wait(80L); } catch (InterruptedException ignored) {}
+                        }
+                        lastNs = System.nanoTime();
+                        nextFrameNs = lastNs;
+                        continue;
+                    }
+
+                    long nowNs = System.nanoTime();
+                    float dt = clamp((nowNs - lastNs) / 1_000_000_000f, 0.001f, 0.05f);
+                    lastNs = nowNs;
+
+                    int generation = prefs.getInt(Prefs.KEY_CONFIG_GENERATION, lastConfigGeneration);
+                    if (generation != lastConfigGeneration) loadPersistentState(false);
+                    if (gridDirty) rebuildGridCache();
+
+                    pollAccessibilityRealOffset(SystemClock.uptimeMillis());
+                    advanceFallbackPhysics(dt);
+                    render(nowNs);
+                    if (!EGL14.eglSwapBuffers(eglDisplay, eglSurface)) break;
+                    updateFps(nowNs);
+
+                    nextFrameNs += 16_666_667L;
+                    long sleepNs = nextFrameNs - System.nanoTime();
+                    if (sleepNs > 1_000_000L) {
+                        try {
+                            long ms = sleepNs / 1_000_000L;
+                            int ns = (int) (sleepNs % 1_000_000L);
+                            Thread.sleep(ms, ns);
+                        } catch (InterruptedException ignored) {}
+                    } else if (sleepNs < -50_000_000L) {
+                        nextFrameNs = System.nanoTime();
                     }
                 }
-                cellsByPage[page] = cells;
+                releaseGl();
             }
 
-            gridDirty = false;
-            glassBitmapDirty = true;
-        }
+            private boolean initEgl() {
+                EGL14.eglBindAPI(EGL14.EGL_OPENGL_ES_API);
+                eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
+                if (eglDisplay == EGL14.EGL_NO_DISPLAY) return false;
+                int[] version = new int[2];
+                if (!EGL14.eglInitialize(eglDisplay, version, 0, version, 1)) return false;
 
-        private void ensureGlassBitmap(int screenW, int screenH) {
-            int pxW = Math.max(12, Math.round(cellWidth * screenW));
-            int pxH = Math.max(12, Math.round(cellHeight * screenH));
-            if (!glassBitmapDirty && glassBitmap != null
-                    && pxW == glassBitmapW && pxH == glassBitmapH
-                    && Math.abs(glassBitmapOpacity - glassOpacity) < 0.001f) return;
+                int[] attrib = {
+                        EGL14.EGL_RENDERABLE_TYPE, 4, // EGL_OPENGL_ES2_BIT
+                        EGL14.EGL_RED_SIZE, 8,
+                        EGL14.EGL_GREEN_SIZE, 8,
+                        EGL14.EGL_BLUE_SIZE, 8,
+                        EGL14.EGL_ALPHA_SIZE, 8,
+                        EGL14.EGL_NONE
+                };
+                EGLConfig[] configs = new EGLConfig[1];
+                int[] num = new int[1];
+                if (!EGL14.eglChooseConfig(eglDisplay, attrib, 0, configs, 0, 1, num, 0) || num[0] == 0) return false;
 
-            if (glassBitmap != null) glassBitmap.recycle();
-            glassBitmap = Bitmap.createBitmap(pxW, pxH, Bitmap.Config.ARGB_8888);
-            Canvas c = new Canvas(glassBitmap);
-            renderGlassTile(c, pxW, pxH, glassOpacity);
-            glassBitmapW = pxW;
-            glassBitmapH = pxH;
-            glassBitmapOpacity = glassOpacity;
-            glassBitmapDirty = false;
-        }
+                int[] ctxAttrib = {0x3098, 2, EGL14.EGL_NONE}; // EGL_CONTEXT_CLIENT_VERSION
+                eglContext = EGL14.eglCreateContext(eglDisplay, configs[0], EGL14.EGL_NO_CONTEXT, ctxAttrib, 0);
+                if (eglContext == EGL14.EGL_NO_CONTEXT) return false;
 
-        private void renderGlassTile(Canvas canvas, int w, int h, float opacity) {
-            float min = Math.min(w, h);
-            float pad = Math.max(2f, min * 0.04f);
-            RectF rect = new RectF(pad, pad, w - pad, h - pad);
-            float radius = min * 0.24f;
+                int[] surfAttrib = {EGL14.EGL_NONE};
+                eglSurface = EGL14.eglCreateWindowSurface(eglDisplay, configs[0], holder.getSurface(), surfAttrib, 0);
+                if (eglSurface == EGL14.EGL_NO_SURFACE) return false;
+                return EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext);
+            }
 
-            paint.setStyle(Paint.Style.FILL);
-            paint.setShader(new LinearGradient(
-                    rect.left, rect.top, rect.right, rect.bottom,
-                    new int[]{
-                            Color.argb((int) (88 * opacity), 255, 255, 255),
-                            Color.argb((int) (24 * opacity), 242, 246, 250),
-                            Color.argb((int) (14 * opacity), 114, 124, 140),
-                            Color.argb((int) (54 * opacity), 255, 255, 255)
-                    },
-                    new float[]{0f, 0.32f, 0.76f, 1f}, Shader.TileMode.CLAMP));
-            canvas.drawRoundRect(rect, radius, radius, paint);
-            paint.setShader(null);
+            private void initGl() {
+                float[] verts = {-1f,-1f, 1f,-1f, -1f,1f, 1f,1f};
+                quad = ByteBuffer.allocateDirect(verts.length * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
+                quad.put(verts).position(0);
 
-            paint.setStyle(Paint.Style.STROKE);
-            paint.setStrokeWidth(Math.max(2f, min * 0.045f));
-            paint.setColor(Color.argb((int) (205 * opacity), 255, 255, 255));
-            canvas.drawRoundRect(rect, radius, radius, paint);
+                bgProgram = buildProgram(VS_BG, FS_BG);
+                glassProgram = buildProgram(VS_GLASS, FS_GLASS);
+                texProgram = buildProgram(VS_TEX, FS_TEX);
 
-            paint.setStrokeWidth(Math.max(1f, min * 0.018f));
-            paint.setColor(Color.argb((int) (110 * opacity), 42, 48, 58));
-            RectF inner = new RectF(rect.left + min * 0.055f, rect.top + min * 0.055f,
-                    rect.right - min * 0.055f, rect.bottom - min * 0.055f);
-            canvas.drawRoundRect(inner, radius * 0.78f, radius * 0.78f, paint);
+                int[] tex = new int[1];
+                GLES20.glGenTextures(1, tex, 0);
+                debugTexture = tex[0];
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, debugTexture);
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR);
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE);
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
 
-            paint.setStrokeWidth(Math.max(1f, min * 0.020f));
-            paint.setColor(Color.argb((int) (118 * opacity), 255, 255, 255));
-            RectF highlight = new RectF(rect.left + min * 0.10f, rect.top + min * 0.08f,
-                    rect.right - min * 0.10f, rect.bottom - min * 0.18f);
-            canvas.drawArc(highlight, 200f, 140f, false, paint);
-            paint.setStyle(Paint.Style.FILL);
-        }
+                debugBitmap = Bitmap.createBitmap(900, 330, Bitmap.Config.ARGB_8888);
+                debugCanvas = new Canvas(debugBitmap);
+                debugPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
-        private void drawGlassPages(Canvas canvas, int w, int h) {
-            if (cellsByPage == null) return;
-            ensureGlassBitmap(w, h);
+                GLES20.glEnable(GLES20.GL_BLEND);
+                GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA);
+            }
 
-            float stepX = cellWidth + gapX;
-            float stepY = cellHeight + gapY;
+            private void render(long nowNs) {
+                int w = Math.max(1, surfaceW), h = Math.max(1, surfaceH);
+                GLES20.glViewport(0, 0, w, h);
+                GLES20.glClearColor(0.01f, 0.01f, 0.03f, 1f);
+                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
 
-            // Only pages that can physically intersect the screen are drawn.
-            int p0 = clampInt((int) Math.floor(glassPosition), 0, pageCount - 1);
-            int p1 = clampInt((int) Math.ceil(glassPosition), 0, pageCount - 1);
-            drawOneGlassPage(canvas, w, h, p0, stepX, stepY);
-            if (p1 != p0) drawOneGlassPage(canvas, w, h, p1, stepX, stepY);
-        }
+                float bgPos, glassPos, energy, opacity, x0, y0, cw, ch, gx, gy;
+                int pages;
+                ArrayList<Cell>[] pageCells;
+                boolean debug;
+                synchronized (stateLock) {
+                    bgPos = virtualPosition;
+                    glassPos = glassPosition;
+                    energy = motionEnergy;
+                    opacity = glassOpacity;
+                    x0 = gridX0; y0 = gridY0; cw = cellWidth; ch = cellHeight; gx = gapX; gy = gapY;
+                    pages = pageCount;
+                    pageCells = cellsByPage;
+                    debug = showDebug;
+                }
 
-        private void drawOneGlassPage(Canvas canvas, int w, int h, int page, float stepX, float stepY) {
-            if (page < 0 || page >= pageCount || cellsByPage[page] == null) return;
-            float pageTranslateX = (page - glassPosition) * w;
+                drawBackground(w, h, nowNs / 1_000_000_000f, bgPos, energy);
+                if (pageCells != null) drawGlass(w, h, glassPos, pages, pageCells, x0, y0, cw, ch, gx, gy, opacity);
+                if (debug) drawDebug(w, h);
+            }
 
-            for (Cell cell : cellsByPage[page]) {
-                float cx = (gridX0 + cell.col * stepX) * w + pageTranslateX;
-                float cy = (gridY0 + cell.row * stepY) * h;
+            private void drawBackground(int w, int h, float time, float pos, float energy) {
+                GLES20.glUseProgram(bgProgram);
+                bindQuad(bgProgram, "aPos");
+                GLES20.glUniform2f(GLES20.glGetUniformLocation(bgProgram, "uRes"), w, h);
+                GLES20.glUniform1f(GLES20.glGetUniformLocation(bgProgram, "uTime"), time);
+                GLES20.glUniform1f(GLES20.glGetUniformLocation(bgProgram, "uPos"), pos);
+                GLES20.glUniform1f(GLES20.glGetUniformLocation(bgProgram, "uEnergy"), energy);
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+            }
 
-                // Skip fully offscreen plates.
-                if (cx < -glassBitmapW || cx > w + glassBitmapW
-                        || cy < -glassBitmapH || cy > h + glassBitmapH) continue;
+            private void drawGlass(int w, int h, float pos, int pages, ArrayList<Cell>[] pageCells,
+                                   float x0, float y0, float cw, float ch, float gx, float gy, float opacity) {
+                GLES20.glUseProgram(glassProgram);
+                bindQuad(glassProgram, "aPos");
+                int uScreen = GLES20.glGetUniformLocation(glassProgram, "uScreen");
+                int uCenter = GLES20.glGetUniformLocation(glassProgram, "uCenter");
+                int uSize = GLES20.glGetUniformLocation(glassProgram, "uSize");
+                int uOpacity = GLES20.glGetUniformLocation(glassProgram, "uOpacity");
+                GLES20.glUniform2f(uScreen, w, h);
+                GLES20.glUniform2f(uSize, cw * w, ch * h);
+                GLES20.glUniform1f(uOpacity, opacity);
 
-                canvas.drawBitmap(glassBitmap,
-                        cx - glassBitmapW * 0.5f,
-                        cy - glassBitmapH * 0.5f,
-                        bitmapPaint);
+                int p0 = clampInt((int) Math.floor(pos), 0, pages - 1);
+                int p1 = clampInt((int) Math.ceil(pos), 0, pages - 1);
+                drawGlassPage(w, h, pos, p0, pageCells[p0], x0, y0, cw + gx, ch + gy, uCenter);
+                if (p1 != p0) drawGlassPage(w, h, pos, p1, pageCells[p1], x0, y0, cw + gx, ch + gy, uCenter);
+            }
+
+            private void drawGlassPage(int w, int h, float pos, int page, ArrayList<Cell> cells,
+                                       float x0, float y0, float stepX, float stepY, int uCenter) {
+                if (cells == null) return;
+                float pageShift = (page - pos) * w;
+                for (Cell cell : cells) {
+                    float cx = (x0 + cell.col * stepX) * w + pageShift;
+                    float cy = (y0 + cell.row * stepY) * h;
+                    if (cx < -w * 0.25f || cx > w * 1.25f || cy < -h * 0.15f || cy > h * 1.15f) continue;
+                    GLES20.glUniform2f(uCenter, cx, cy);
+                    GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+                }
+            }
+
+            private void drawDebug(int w, int h) {
+                long now = SystemClock.uptimeMillis();
+                if (now - lastDebugUploadMs > 220L) {
+                    lastDebugUploadMs = now;
+                    updateDebugBitmap();
+                    GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, debugTexture);
+                    GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, debugBitmap, 0);
+                }
+                GLES20.glUseProgram(texProgram);
+                bindQuad(texProgram, "aPos");
+                GLES20.glUniform2f(GLES20.glGetUniformLocation(texProgram, "uScreen"), w, h);
+                GLES20.glUniform2f(GLES20.glGetUniformLocation(texProgram, "uCenter"), w * 0.50f, h * 0.145f);
+                GLES20.glUniform2f(GLES20.glGetUniformLocation(texProgram, "uSize"), w * 0.94f, h * 0.25f);
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, debugTexture);
+                GLES20.glUniform1i(GLES20.glGetUniformLocation(texProgram, "uTex"), 0);
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+            }
+
+            private void updateDebugBitmap() {
+                debugBitmap.eraseColor(Color.TRANSPARENT);
+                debugPaint.setStyle(Paint.Style.FILL);
+                debugPaint.setColor(Color.argb(220, 0, 0, 0));
+                debugCanvas.drawRoundRect(new RectF(8, 8, 892, 322), 38, 38, debugPaint);
+                debugPaint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+                debugPaint.setTextSize(54f);
+                debugPaint.setColor(Color.WHITE);
+                debugCanvas.drawText("GPU + Real Offset v0.7", 38, 68, debugPaint);
+                debugPaint.setTypeface(android.graphics.Typeface.DEFAULT);
+                debugPaint.setTextSize(36f);
+
+                String line1, line2, line3, line4, line5;
+                synchronized (stateLock) {
+                    line1 = String.format(Locale.US, "FPS %.1f   SOURCE %s", measuredFps, offsetSource);
+                    line2 = String.format(Locale.US, "BG %.3f  GLASS %.3f  PAGE %d/%d", virtualPosition, glassPosition, currentPage + 1, pageCount);
+                    line3 = String.format(Locale.US, "A11Y x=%d max=%d dx=%d", a11yScrollX, a11yMaxScrollX, a11yDeltaX);
+                    line4 = String.format(Locale.US, "idx %d>%d count=%d  %s", a11yFrom, a11yTo, a11yCount, trim(a11yClass, 26));
+                    line5 = trim(lastDecision + (a11ySummary.isEmpty() ? "" : " | " + a11ySummary), 72);
+                }
+                debugPaint.setColor(Color.rgb(145, 255, 180)); debugCanvas.drawText(line1, 38, 118, debugPaint);
+                debugPaint.setColor(Color.rgb(185, 220, 255)); debugCanvas.drawText(line2, 38, 164, debugPaint);
+                debugPaint.setColor(Color.WHITE); debugCanvas.drawText(line3, 38, 210, debugPaint);
+                debugCanvas.drawText(line4, 38, 256, debugPaint);
+                debugPaint.setColor(Color.rgb(255, 226, 150)); debugCanvas.drawText(line5, 38, 302, debugPaint);
+            }
+
+            private void bindQuad(int program, String attr) {
+                int loc = GLES20.glGetAttribLocation(program, attr);
+                quad.position(0);
+                GLES20.glEnableVertexAttribArray(loc);
+                GLES20.glVertexAttribPointer(loc, 2, GLES20.GL_FLOAT, false, 0, quad);
+            }
+
+            private int buildProgram(String vs, String fs) {
+                int v = compile(GLES20.GL_VERTEX_SHADER, vs);
+                int f = compile(GLES20.GL_FRAGMENT_SHADER, fs);
+                int p = GLES20.glCreateProgram();
+                GLES20.glAttachShader(p, v);
+                GLES20.glAttachShader(p, f);
+                GLES20.glLinkProgram(p);
+                int[] ok = new int[1];
+                GLES20.glGetProgramiv(p, GLES20.GL_LINK_STATUS, ok, 0);
+                if (ok[0] == 0) throw new RuntimeException("GL link: " + GLES20.glGetProgramInfoLog(p));
+                GLES20.glDeleteShader(v); GLES20.glDeleteShader(f);
+                return p;
+            }
+
+            private int compile(int type, String src) {
+                int s = GLES20.glCreateShader(type);
+                GLES20.glShaderSource(s, src);
+                GLES20.glCompileShader(s);
+                int[] ok = new int[1];
+                GLES20.glGetShaderiv(s, GLES20.GL_COMPILE_STATUS, ok, 0);
+                if (ok[0] == 0) throw new RuntimeException("GL shader: " + GLES20.glGetShaderInfoLog(s));
+                return s;
+            }
+
+            private void updateFps(long nowNs) {
+                if (fpsStartNs == 0L) fpsStartNs = nowNs;
+                fpsFrames++;
+                long elapsed = nowNs - fpsStartNs;
+                if (elapsed >= 1_000_000_000L) {
+                    measuredFps = fpsFrames * 1_000_000_000f / elapsed;
+                    fpsFrames = 0;
+                    fpsStartNs = nowNs;
+                }
+            }
+
+            private void releaseGl() {
+                if (debugBitmap != null) debugBitmap.recycle();
+                if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
+                    EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
+                    if (eglSurface != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(eglDisplay, eglSurface);
+                    if (eglContext != EGL14.EGL_NO_CONTEXT) EGL14.eglDestroyContext(eglDisplay, eglContext);
+                    EGL14.eglTerminate(eglDisplay);
+                }
             }
         }
 
-        private void drawDiagnostics(Canvas canvas, int w, int h) {
-            float margin = w * 0.045f;
-            float panelTop = h * 0.055f;
-            float panelBottom = h * 0.36f;
-            paint.setStyle(Paint.Style.FILL);
-            paint.setColor(Color.argb(220, 0, 0, 0));
-            canvas.drawRoundRect(margin, panelTop, w - margin, panelBottom, 30f, 30f, paint);
-
-            float left = margin * 1.45f;
-            float y = panelTop + h * 0.044f;
-            float line = h * 0.035f;
-
-            paint.setTextAlign(Paint.Align.LEFT);
-            paint.setColor(Color.WHITE);
-            paint.setFakeBoldText(true);
-            paint.setTextSize(Math.max(27f, w * 0.044f));
-            canvas.drawText("Iridescent + Glass v0.6", left, y, paint);
-            paint.setFakeBoldText(false);
-
-            y += line * 1.25f;
-            paint.setTextSize(Math.max(17f, w * 0.027f));
-            paint.setColor(Color.rgb(135, 255, 177));
-            canvas.drawText(String.format(Locale.US,
-                    "FPS %.1f  %s  BG %dx%d",
-                    measuredFps, lastFrameHardware ? "HW" : "SW", backgroundW, backgroundH), left, y, paint);
-
-            y += line;
-            paint.setColor(Color.rgb(180, 220, 255));
-            canvas.drawText(String.format(Locale.US,
-                    "BG %.3f  GLASS %.3f  PAGE %d/%d",
-                    virtualPosition, glassPosition, currentPage + 1, pageCount), left, y, paint);
-
-            y += line;
-            paint.setColor(Color.rgb(230, 230, 230));
-            canvas.drawText(String.format(Locale.US,
-                    "TOUCH dx %.0f  vx %.0f  SENS %.2fx",
-                    touchDx, touchVelocityX, swipeSensitivity), left, y, paint);
-
-            y += line;
-            paint.setColor(Color.rgb(230, 230, 230));
-            canvas.drawText(String.format(Locale.US,
-                    "CELL %dx%d  GAP %dx%d",
-                    Math.round(cellWidth * w), Math.round(cellHeight * h),
-                    Math.round(gapX * w), Math.round(gapY * h)), left, y, paint);
-
-            y += line;
-            paint.setColor(Color.rgb(255, 225, 145));
-            canvas.drawText(lastDecision, left, y, paint);
-            paint.setFakeBoldText(false);
+        private String trim(String s, int max) {
+            if (s == null) return "";
+            return s.length() <= max ? s : s.substring(0, max);
         }
 
-        private int clampInt(int value, int min, int max) {
-            return Math.max(min, Math.min(max, value));
-        }
+        private int clampInt(int value, int min, int max) { return Math.max(min, Math.min(max, value)); }
+        private float clamp(float value, float min, float max) { return Math.max(min, Math.min(max, value)); }
 
-        private float clamp(float value, float min, float max) {
-            return Math.max(min, Math.min(max, value));
-        }
+        private static final String VS_BG =
+                "attribute vec2 aPos; varying vec2 vUv; void main(){ vUv=aPos*0.5+0.5; gl_Position=vec4(aPos,0.0,1.0); }";
+
+        private static final String FS_BG =
+                "precision mediump float; varying vec2 vUv; uniform vec2 uRes; uniform float uTime; uniform float uPos; uniform float uEnergy;" +
+                "float g(vec2 p, vec2 c, float r){ float d=length(p-c); return 1.0-smoothstep(0.0,r,d); }" +
+                "void main(){" +
+                " vec2 p=vUv; float asp=uRes.x/uRes.y; vec2 q=vec2((p.x-0.5)*asp,p.y-0.5);" +
+                " vec3 col=mix(vec3(0.008,0.014,0.04),vec3(0.035,0.01,0.06),p.y);" +
+                " float ph=uPos*0.62; float t=uTime;" +
+                " vec2 c1=vec2((-0.24+0.20*sin(ph+t*0.08))*asp,-0.20+0.06*cos(t*0.17+ph));" +
+                " vec2 c2=vec2(( 0.27+0.16*cos(ph*1.11-t*0.06))*asp,-0.06+0.08*sin(t*0.14-ph));" +
+                " vec2 c3=vec2((-0.15+0.21*cos(ph*0.91+1.7))*asp, 0.27+0.04*sin(t*0.23));" +
+                " vec2 c4=vec2(( 0.32-0.18*sin(ph*0.77+0.8))*asp, 0.33-0.04*cos(t*0.19));" +
+                " float split=uEnergy*0.055*asp; c1.x-=split; c2.x+=split; c3.x+=split*0.7; c4.x-=split*0.45;" +
+                " col+=vec3(0.00,0.72,1.00)*g(q,c1,0.72);" +
+                " col+=vec3(0.32,0.05,0.95)*g(q,c2,0.64);" +
+                " col+=vec3(0.95,0.00,0.62)*g(q,c3,0.58);" +
+                " col+=vec3(1.00,0.28,0.02)*g(q,c4,0.48);" +
+                " float band=1.0-smoothstep(0.02+uEnergy*0.02,0.12+uEnergy*0.05,abs(fract((p.x+p.y*0.42)+uPos*0.10+t*0.012)-0.50));" +
+                " col+=band*vec3(0.16,0.18,0.22);" +
+                " float vig=smoothstep(0.34,0.78,length(q)); col*=mix(1.0,0.45,vig);" +
+                " gl_FragColor=vec4(col,1.0); }";
+
+        private static final String VS_GLASS =
+                "attribute vec2 aPos; varying vec2 vLocal; uniform vec2 uScreen; uniform vec2 uCenter; uniform vec2 uSize;" +
+                "void main(){ vLocal=aPos; vec2 px=uCenter+aPos*uSize*0.5; vec2 clip=vec2(px.x/uScreen.x*2.0-1.0,1.0-px.y/uScreen.y*2.0); gl_Position=vec4(clip,0.0,1.0); }";
+
+        private static final String FS_GLASS =
+                "precision mediump float; varying vec2 vLocal; uniform float uOpacity;" +
+                "float sdRoundBox(vec2 p, vec2 b, float r){ vec2 q=abs(p)-b+r; return min(max(q.x,q.y),0.0)+length(max(q,0.0))-r; }" +
+                "void main(){ float d=sdRoundBox(vLocal,vec2(1.0),0.32); float inside=1.0-smoothstep(-0.02,0.02,d);" +
+                " float edge=1.0-smoothstep(0.00,0.085,abs(d)); float inner=1.0-smoothstep(0.10,0.20,abs(d+0.10));" +
+                " float shine=smoothstep(-0.35,0.75,-vLocal.y+vLocal.x*0.18)*0.16;" +
+                " vec3 col=vec3(0.92,0.95,1.0)+shine; float a=inside*(0.045+uOpacity*0.10)+edge*(0.30+uOpacity*0.42)+inner*0.05;" +
+                " gl_FragColor=vec4(col,clamp(a,0.0,0.82)*inside); }";
+
+        private static final String VS_TEX =
+                "attribute vec2 aPos; varying vec2 vUv; uniform vec2 uScreen; uniform vec2 uCenter; uniform vec2 uSize;" +
+                "void main(){ vUv=vec2(aPos.x*0.5+0.5,1.0-(aPos.y*0.5+0.5)); vec2 px=uCenter+aPos*uSize*0.5; vec2 clip=vec2(px.x/uScreen.x*2.0-1.0,1.0-px.y/uScreen.y*2.0); gl_Position=vec4(clip,0.0,1.0); }";
+
+        private static final String FS_TEX =
+                "precision mediump float; varying vec2 vUv; uniform sampler2D uTex; void main(){ gl_FragColor=texture2D(uTex,vUv); }";
     }
 }

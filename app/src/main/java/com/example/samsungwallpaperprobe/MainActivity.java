@@ -5,6 +5,10 @@ import android.app.WallpaperManager;
 import android.content.ComponentName;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.accessibilityservice.AccessibilityServiceInfo;
+import android.view.accessibility.AccessibilityManager;
+import android.provider.Settings;
+import java.util.List;
 import android.graphics.Color;
 import android.os.Bundle;
 import android.view.Gravity;
@@ -23,6 +27,7 @@ public class MainActivity extends Activity {
     private TextView currentValue;
     private TextView sensitivityValue;
     private Button debugButton;
+    private TextView realOffsetStatus;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -38,6 +43,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        refreshRealOffsetStatus();
         if (pagesValue != null) refreshValues();
     }
 
@@ -72,12 +78,12 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView title = text("Iridescent Wallpaper Lab v0.6", 25f, Color.BLACK, true);
+        TextView title = text("Iridescent Wallpaper Lab v0.7", 25f, Color.BLACK, true);
         title.setGravity(Gravity.CENTER);
         root.addView(title, matchWrap());
 
         TextView body = text(
-                "v0.6: ускоренный рендер стекла и новая геометрия сетки. Теперь отдельно настраиваются ширина/высота ячейки и реальные зазоры между ячейками по X/Y. Отладка сохранена и показывает FPS.",
+                "v0.7: фон и стекло переведены на GPU/OpenGL. Плюс появился экспериментальный способ читать РЕАЛЬНЫЙ скролл One UI через системную службу специальных возможностей — без угадывания виртуального offset. Если Samsung отдаёт scrollX, виртуальная модель вообще не используется.",
                 16f, Color.DKGRAY, false);
         body.setGravity(Gravity.CENTER);
         body.setPadding(0, dp(14), 0, dp(20));
@@ -101,6 +107,23 @@ public class MainActivity extends Activity {
         sensitivityValue = text("", 27f, Color.BLACK, true);
         sensitivityValue.setGravity(Gravity.CENTER);
         root.addView(makeSensitivityStepper(), matchWrap());
+
+        realOffsetStatus = text("", 15f, Color.DKGRAY, true);
+        realOffsetStatus.setGravity(Gravity.CENTER);
+        realOffsetStatus.setPadding(0, dp(18), 0, dp(6));
+        root.addView(realOffsetStatus, matchWrap());
+
+        Button accessibilityButton = new Button(this);
+        accessibilityButton.setText("ВКЛЮЧИТЬ РЕАЛЬНЫЙ OFFSET ONE UI");
+        accessibilityButton.setOnClickListener(v -> startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
+        root.addView(accessibilityButton, matchWrap());
+
+        TextView accessibilityHint = text(
+                "В системных настройках включи службу ‘One UI Offset Probe’. Она настроена получать события ТОЛЬКО от One UI Home (com.sec.android.app.launcher), не запрашивает содержимое окон других приложений и приложению не выдано разрешение INTERNET. После включения вернись сюда и затем на рабочий стол.",
+                13.5f, Color.DKGRAY, false);
+        accessibilityHint.setGravity(Gravity.CENTER);
+        accessibilityHint.setPadding(0, dp(6), 0, dp(8));
+        root.addView(accessibilityHint, matchWrap());
 
         Button gridEditor = new Button(this);
         gridEditor.setText("РЕДАКТОР СЕТКИ И СТЕКЛА");
@@ -237,6 +260,27 @@ public class MainActivity extends Activity {
         if (debugButton != null) {
             debugButton.setText(debug ? "ОТЛАДКА: ВКЛ" : "ОТЛАДКА: ВЫКЛ");
         }
+        refreshRealOffsetStatus();
+    }
+
+    private void refreshRealOffsetStatus() {
+        if (realOffsetStatus == null) return;
+        AccessibilityManager am = (AccessibilityManager) getSystemService(ACCESSIBILITY_SERVICE);
+        boolean enabled = false;
+        if (am != null) {
+            List<AccessibilityServiceInfo> list = am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK);
+            for (AccessibilityServiceInfo info : list) {
+                if (info.getResolveInfo() != null && info.getResolveInfo().serviceInfo != null
+                        && getPackageName().equals(info.getResolveInfo().serviceInfo.packageName)
+                        && LauncherAccessibilityService.class.getName().equals(info.getResolveInfo().serviceInfo.name)) {
+                    enabled = true; break;
+                }
+            }
+        }
+        realOffsetStatus.setText(enabled
+                ? "REAL OFFSET: служба включена ✓"
+                : "REAL OFFSET: служба пока выключена");
+        realOffsetStatus.setTextColor(enabled ? Color.rgb(20, 125, 65) : Color.rgb(145, 75, 20));
     }
 
     private TextView text(String value, float sp, int color, boolean bold) {
