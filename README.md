@@ -1,22 +1,15 @@
-# Iridescent Wallpaper v0.13
+# Iridescent Wallpaper v0.14
 
-Точечная правка поведения стекла. Сетка и редактор НЕ менялись относительно v0.12/v0.8-восстановления.
+Targeted motion-only revision. Grid/editor data and cell assignments are intentionally untouched.
 
-## Что исправлено
+## What changed
 
-1. **Стекло больше не должно ждать на старой странице и потом резко догонять новую.**
-   - После отпускания используется более реалистичный для текущего One UI визуальный прогноз: 28% ширины для медленного перехода или быстрый release при хотя бы 7% пройденной ширины.
-   - Маленький медленный pull всё ещё возвращается на текущую страницу.
-   - Если accessibility после release быстро сообщает другую страницу и жест был явно не слабым, эта страница сразу становится только ВИЗУАЛЬНОЙ целью. Сохраняется она всё равно только после подтверждения.
-   - Quintic-анимация после release сокращена примерно до 190–390 мс вместо возможных 750 мс.
+- Restored the slower Samsung/Launcher3-style quintic return timing used before v0.13. Slow cancelled drags can take up to ~750 ms instead of being forced into the 190–390 ms window.
+- Startup tracking now uses the v0.12 90 ms touch-slop catch-up, but with **all velocity/input-lag lead removed**. This is intended to remove the initial few-pixel overshoot while reaching 1:1 tracking quickly.
+- No grid geometry, editor, app-cell assignment, glass rendering, or page-continuity code was changed in this revision.
 
-2. **Убрано ускорение стекла в первые миллисекунды свайпа.**
-   - Полностью удалена компенсация `velocity * deliveryLag`.
-   - Накопленный touch-slop возвращается через 320 мс с smootherstep (нулевая скорость в начале), поэтому больше не должно быть эффекта «стекло сначала едет быстрее иконки, затем синхронизируется».
+## What to test
 
-3. **Стекло не должно исчезать между страницами.**
-   - Renderer теперь рассматривает все непустые страницы каждый кадр и отбрасывает только реально ушедшие за экран ячейки. Нет зависимости от `floor/ceil(offset)`.
-
-## Важно
-
-Геометрия сетки, назначение приложений, редактор и v0.8 preset в этой версии не трогались.
+1. Start a very slow horizontal drag and watch the first 100–150 ms: glass should not jump ahead.
+2. Pull only a short distance and release slowly: glass should return with the slower One UI-like easing rather than snapping back.
+3. Continue a normal drag after the first ~100 ms: glass should settle into 1:1 motion with the icon.

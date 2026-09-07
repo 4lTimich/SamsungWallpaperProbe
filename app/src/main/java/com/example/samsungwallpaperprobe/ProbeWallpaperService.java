@@ -486,21 +486,23 @@ public class ProbeWallpaperService extends WallpaperService {
         }
 
         private int launcherSnapDurationMs(int destination, float velocityPx) {
-            // v0.13: the old archived PagedView duration could stretch to 750 ms. On the
-            // tested One UI this visually lagged behind the launcher after ACTION_UP.
-            // Keep the same quintic shape but use a shorter velocity-aware window.
+            // v0.14: restore the slower Launcher3/Samsung-style return curve from v0.12.
+            // v0.13 shortened this too aggressively, so short cancelled drags snapped back
+            // visibly faster than One UI's icons. Keep the same quintic easing, but let slow
+            // returns breathe and use velocity only when the gesture was genuinely fast.
             int w = Math.max(1, surfaceW);
-            float remainingPages = Math.abs(destination - glassPosition);
-            float speedPages = Math.abs(velocityPx) / Math.max(1f, w);
-
-            int duration;
-            if (speedPages >= 1.35f) duration = 210;
-            else if (speedPages >= 0.85f) duration = 245;
-            else if (speedPages >= 0.45f) duration = 285;
-            else duration = 330;
-
-            duration += Math.round(clamp(remainingPages - 0.35f, 0f, 0.65f) * 80f);
-            return clampInt(duration, 190, 390);
+            float distancePx = Math.abs(destination - glassPosition) * w;
+            if (Math.abs(velocityPx) < minFlingPx) {
+                return 750;
+            }
+            float half = w * 0.5f;
+            float ratio = Math.min(1f, distancePx / Math.max(1f, w));
+            float f = ratio - 0.5f;
+            f *= 0.3f * (float) Math.PI / 2f;
+            float influencedDistance = half + half * (float) Math.sin(f);
+            float v = Math.max(minSnapPx, Math.abs(velocityPx));
+            int duration = 4 * Math.round(1000f * Math.abs(influencedDistance / v));
+            return clampInt(duration, 180, 750);
         }
 
         private void startQuinticSnap(int destination, int durationMs, String reason) {
@@ -538,13 +540,16 @@ public class ProbeWallpaperService extends WallpaperService {
         private float launcherLikeVisualDx() {
             if (!visualScrollStarted) return 0f;
 
-            // v0.13: remove ALL velocity lead. Even measured delivery-lag compensation made
-            // the glass start a few pixels faster than the icon. The slop distance is still
-            // recovered, but very slowly, so there is no visible initial acceleration spike.
+            // v0.14: combine the two behaviours that tested best on-device:
+            // - v0.12's quick slop catch-up (~90 ms), which stayed in phase once scrolling began;
+            // - v0.13's removal of ALL velocity/input-lag lead, which was the source of the
+            //   initial 3–4 px forward jump.
+            //
+            // This starts at exactly zero, catches the slop distance over 90 ms, then becomes
+            // pure 1:1 touch tracking. No extrapolation, no fixed lead, no velocity boost.
             float elapsedMs = Math.max(0f, SystemClock.uptimeMillis() - visualScrollStartMs);
-            float t = clamp(elapsedMs / 320f, 0f, 1f);
-            // smootherstep: zero derivative at both ends -> no startup kick.
-            float smooth = t * t * t * (t * (t * 6f - 15f) + 10f);
+            float t = clamp(elapsedMs / 90f, 0f, 1f);
+            float smooth = t * t * (3f - 2f * t);
             return (touchX - visualScrollOriginX) + visualScrollCatchupPx * smooth;
         }
 
