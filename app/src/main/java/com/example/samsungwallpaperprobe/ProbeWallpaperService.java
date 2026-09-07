@@ -26,12 +26,12 @@ import java.util.ArrayList;
 import java.util.Locale;
 
 /**
- * v0.9: GPU wallpaper renderer with smooth hybrid One UI tracking.
+ * v0.10: GPU wallpaper renderer with debounced One UI authority and release prediction.
  *
- * While the finger is down, glass follows raw touch 1:1 because that is the smoothest
- * signal Android gives a live wallpaper. Accessibility data is used as an authority
- * and post-release target, but sparse A11Y samples are never copied straight to the
- * visible glass position; they are interpolated by a 60 fps critically-damped spring.
+ * While the finger is down, glass follows raw touch 1:1. On release we never stop
+ * dead: a visual-only prediction keeps the animation moving while accessibility settles.
+ * One UI page-index events are debounced and validated before they can commit a page,
+ * preventing tiny slow drags from being mistaken for a completed transition.
  */
 public class ProbeWallpaperService extends WallpaperService {
 
@@ -105,6 +105,17 @@ public class ProbeWallpaperService extends WallpaperService {
         private boolean a11yContinuousThisGesture = false;
         private int a11yDeltaSign = 0;
         private float glassVisibility = 1f;
+
+        // v0.10: page-index events from One UI can arrive before the launcher has
+        // actually settled. Keep them as candidates first; only a stable/credible
+        // candidate is allowed to become the persistent page.
+        private int pendingA11yPage = -1;
+        private int pendingA11yPageHits = 0;
+        private long pendingA11yPageMs = 0L;
+        private float releaseDistancePages = 0f;
+        private float releaseVelocityPages = 0f;
+        private boolean releaseWasWeak = true;
+        private boolean releaseWasHorizontal = true;
 
         // Grid cache.
         private int gridCols = Prefs.DEFAULT_COLS;
@@ -267,6 +278,13 @@ public class ProbeWallpaperService extends WallpaperService {
                         awaitingA11yDecision = false;
                         a11yContinuousThisGesture = false;
                         a11yDeltaSign = 0;
+                        pendingA11yPage = -1;
+                        pendingA11yPageHits = 0;
+                        pendingA11yPageMs = 0L;
+                        releaseDistancePages = 0f;
+                        releaseVelocityPages = 0f;
+                        releaseWasWeak = true;
+                        releaseWasHorizontal = true;
                         if (LauncherScrollBus.serviceConnected) {
                             realPosition = currentPage;
                             lastDecision = "A11Y AUTHORITY + TOUCH PREVIEW";
@@ -310,14 +328,15 @@ public class ProbeWallpaperService extends WallpaperService {
                             awaitingA11yDecision = true;
                             a11yReleaseMs = now;
                             targetPage = currentPage;
-                            // Hold exactly where the finger released. A11Y will move the
-                            // TARGET from here; the visible glass is eased at render rate.
-                            glassTargetPosition = glassPosition;
-                            virtualTargetPosition = virtualPosition;
-                            glassVelocity = 0f;
-                            visualVelocity = 0f;
-                            lastDecision = "WAIT ONE UI — NO PAGE GUESS";
-                            offsetSource = "A11Y WAIT";
+                            // v0.10: do not freeze for 100-300 ms waiting for the next
+                            // accessibility packet. Pick a VISUAL target only, based on
+                            // the release gesture, and keep some release velocity. This
+                            // target is never persisted; A11Y still owns the final page.
+                            prepareA11yReleasePrediction();
+                            lastDecision = releaseWasWeak
+                                    ? "WAIT ONE UI — PREDICT RETURN"
+                                    : "WAIT ONE UI — PREDICT SLIDE";
+                            offsetSource = "A11Y PREDICT";
                         } else {
                             finishFallbackGesture(event.getActionMasked() == MotionEvent.ACTION_CANCEL);
                         }
@@ -325,6 +344,46 @@ public class ProbeWallpaperService extends WallpaperService {
                 }
             }
             if (renderThread != null) renderThread.wakeUp();
+        }
+
+        private void prepareA11yReleasePrediction() {
+            int w = Math.max(1, surfaceW);
+            releaseDistancePages = -touchDx / w;
+            releaseVelocityPages = -touchVelocityX / w;
+            releaseWasHorizontal = Math.abs(touchDx) > Math.abs(touchDy) * 0.72f;
+
+            // Slow, short releases should almost always snap back in One UI.
+            // This is deliberately stricter than the old virtual-page heuristic.
+            releaseWasWeak = !releaseWasHorizontal
+                    || (Math.abs(releaseDistancePages) < 0.30f
+                    && Math.abs(releaseVelocityPages) < 0.48f);
+
+            int provisionalPage = currentPage;
+            if (!releaseWasWeak) {
+                float signal = Math.abs(releaseVelocityPages) >= 0.34f
+                        ? releaseVelocityPages : releaseDistancePages;
+                int direction = signal > 0f ? 1 : -1;
+                provisionalPage = clampInt(currentPage + direction, 0, pageCount - 1);
+            }
+
+            glassTargetPosition = provisionalPage;
+            virtualTargetPosition = provisionalPage;
+
+            // Preserve a restrained amount of fling energy so the frame after ACTION_UP
+            // continues from the finger's motion instead of visibly pausing.
+            glassVelocity = clamp(releaseVelocityPages * 0.34f, -1.45f, 1.45f);
+            visualVelocity = clamp(releaseVelocityPages * swipeSensitivity * 0.30f, -1.90f, 1.90f);
+        }
+
+        private void observeA11yPageCandidate(int page, long nowMs) {
+            int candidate = clampInt(page, 0, pageCount - 1);
+            if (pendingA11yPage == candidate) {
+                pendingA11yPageHits++;
+            } else {
+                pendingA11yPage = candidate;
+                pendingA11yPageHits = 1;
+            }
+            pendingA11yPageMs = nowMs;
         }
 
         private void updateAuthoritativeTouchPreview() {
@@ -488,7 +547,11 @@ public class ProbeWallpaperService extends WallpaperService {
             if (isScrollEvent && !dragging && postReleaseEvent
                     && a11yCount == pageCount && a11yTo >= 0 && a11yTo < pageCount) {
                 synchronized (stateLock) {
-                    commitAuthoritativePage(a11yTo, "ONE UI PAGE " + (a11yTo + 1));
+                    // Do not commit a single early page-index packet. One UI can emit
+                    // the next index while a slow partial drag is still springing back.
+                    observeA11yPageCandidate(a11yTo, nowMs);
+                    lastDecision = "A11Y PAGE CANDIDATE " + (a11yTo + 1)
+                            + " x" + pendingA11yPageHits;
                 }
             }
 
@@ -508,6 +571,9 @@ public class ProbeWallpaperService extends WallpaperService {
             realSettledForEvent = true;
             realOffsetLocked = true;
             a11yContinuousThisGesture = false;
+            pendingA11yPage = -1;
+            pendingA11yPageHits = 0;
+            pendingA11yPageMs = 0L;
             offsetSource = "A11Y PAGE → EASE";
             lastDecision = reason + " ✓";
             LauncherScrollBus.authoritativePage = settled;
@@ -518,32 +584,75 @@ public class ProbeWallpaperService extends WallpaperService {
         private void handleA11yQuietPeriod(long nowMs) {
             if (!LauncherScrollBus.serviceConnected) return;
 
-            // If continuous One UI scroll data has actually come to rest almost exactly
-            // on a page, it is safe to commit that page even without a separate index event.
+            // Best evidence: continuous scroll coordinates actually came to rest very
+            // close to a page. This can commit without any page-index heuristic.
             if (a11yContinuousThisGesture && !dragging
-                    && nowMs - lastA11yMotionMs > 150L) {
+                    && nowMs - lastA11yMotionMs > 170L) {
                 int nearest = clampInt(Math.round(realPosition), 0, pageCount - 1);
-                if (Math.abs(realPosition - nearest) < 0.10f) {
+                if (Math.abs(realPosition - nearest) < 0.085f) {
                     synchronized (stateLock) {
                         commitAuthoritativePage(nearest, "A11Y MOTION SETTLED " + (nearest + 1));
                     }
-                    a11yContinuousThisGesture = false;
                     return;
                 }
             }
 
-            // No continuous scroll and no final page event: never guess. The partial swipe
-            // is treated as cancelled and our glass returns to the already-known page.
-            if (awaitingA11yDecision && nowMs - a11yReleaseMs > 430L
-                    && nowMs - lastA11yMotionMs > 170L) {
+            // Debounce One UI's page-index signal. The key fix for v0.10: a tiny slow
+            // drag cannot switch our logical page just because one premature toIndex
+            // packet said "next page".
+            if (!dragging && pendingA11yPage >= 0
+                    && nowMs - pendingA11yPageMs > 145L) {
+                int candidate = pendingA11yPage;
+                boolean sameAsCurrent = candidate == currentPage;
+                boolean continuousSupports = a11yContinuousThisGesture
+                        && Math.abs(realPosition - candidate) < 0.18f;
+                boolean directionSupports = candidate != currentPage
+                        && releaseWasHorizontal
+                        && Integer.signum(candidate - currentPage)
+                        == Integer.signum((int) Math.signum(
+                                Math.abs(releaseVelocityPages) >= 0.34f
+                                        ? releaseVelocityPages : releaseDistancePages));
+                boolean strongRelease = !releaseWasWeak && directionSupports;
+                boolean repeated = pendingA11yPageHits >= 2;
+
+                // Returning to the known page is always safe. Moving away requires either
+                // continuous scroll evidence, or a strong release plus a stable candidate.
+                if (sameAsCurrent || continuousSupports
+                        || (strongRelease && (repeated || nowMs - a11yReleaseMs > 260L))) {
+                    synchronized (stateLock) {
+                        commitAuthoritativePage(candidate, "ONE UI CONFIRMED " + (candidate + 1));
+                    }
+                    return;
+                }
+
+                // Weak release + contradictory next-page candidate: discard it. Keep
+                // waiting briefly in case One UI emits the corrected current page.
+                if (releaseWasWeak && candidate != currentPage
+                        && nowMs - a11yReleaseMs > 260L) {
+                    pendingA11yPage = -1;
+                    pendingA11yPageHits = 0;
+                    pendingA11yPageMs = 0L;
+                    glassTargetPosition = currentPage;
+                    virtualTargetPosition = currentPage;
+                    offsetSource = "A11Y REJECT FALSE PAGE";
+                    lastDecision = "WEAK RELEASE — IGNORE EARLY PAGE INDEX";
+                }
+            }
+
+            // No credible One UI confirmation: return to the already-known page.
+            if (awaitingA11yDecision && nowMs - a11yReleaseMs > 520L
+                    && nowMs - lastA11yMotionMs > 190L) {
                 synchronized (stateLock) {
                     targetPage = currentPage;
                     realPosition = currentPage;
                     glassTargetPosition = currentPage;
                     virtualTargetPosition = currentPage;
                     awaitingA11yDecision = false;
+                    pendingA11yPage = -1;
+                    pendingA11yPageHits = 0;
+                    pendingA11yPageMs = 0L;
                     offsetSource = "A11Y HOLD → EASE BACK";
-                    lastDecision = "NO ONE UI PAGE CHANGE — RETURN";
+                    lastDecision = "NO CONFIRMED PAGE CHANGE — RETURN";
                 }
             }
         }
@@ -555,11 +664,11 @@ public class ProbeWallpaperService extends WallpaperService {
                     // integrated every render frame. Damping is slightly over-critical so
                     // there is no oscillation/stair-step, but the response remains quick.
                     float bgD = virtualTargetPosition - virtualPosition;
-                    visualVelocity += (bgD * 78f - visualVelocity * 18.5f) * dt;
+                    visualVelocity += (bgD * 66f - visualVelocity * 17.8f) * dt;
                     virtualPosition += visualVelocity * dt;
 
                     float glassD = glassTargetPosition - glassPosition;
-                    glassVelocity += (glassD * 118f - glassVelocity * 22.5f) * dt;
+                    glassVelocity += (glassD * 92f - glassVelocity * 20.5f) * dt;
                     glassPosition += glassVelocity * dt;
 
                     if (Math.abs(bgD) < 0.0008f && Math.abs(visualVelocity) < 0.006f) {
@@ -846,7 +955,7 @@ public class ProbeWallpaperService extends WallpaperService {
                 debugPaint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
                 debugPaint.setTextSize(54f);
                 debugPaint.setColor(Color.WHITE);
-                debugCanvas.drawText("GPU Smooth Hybrid v0.9", 38, 68, debugPaint);
+                debugCanvas.drawText("GPU Debounced Hybrid v0.10", 38, 68, debugPaint);
                 debugPaint.setTypeface(android.graphics.Typeface.DEFAULT);
                 debugPaint.setTextSize(36f);
 
@@ -855,7 +964,9 @@ public class ProbeWallpaperService extends WallpaperService {
                     line1 = String.format(Locale.US, "FPS %.1f   SOURCE %s", measuredFps, offsetSource);
                     line2 = String.format(Locale.US, "BG %.3f→%.3f  GLASS %.3f→%.3f  P %d/%d", virtualPosition, virtualTargetPosition, glassPosition, glassTargetPosition, currentPage + 1, pageCount);
                     line3 = String.format(Locale.US, "A11Y x=%d max=%d dx=%d", a11yScrollX, a11yMaxScrollX, a11yDeltaX);
-                    line4 = String.format(Locale.US, "idx %d>%d count=%d  %s", a11yFrom, a11yTo, a11yCount, trim(a11yClass, 26));
+                    line4 = String.format(Locale.US, "idx %d>%d count=%d  cand=%d x%d",
+                            a11yFrom, a11yTo, a11yCount,
+                            pendingA11yPage < 0 ? 0 : pendingA11yPage + 1, pendingA11yPageHits);
                     line5 = trim(lastDecision + (a11ySummary.isEmpty() ? "" : " | " + a11ySummary), 72);
                 }
                 debugPaint.setColor(Color.rgb(145, 255, 180)); debugCanvas.drawText(line1, 38, 118, debugPaint);
